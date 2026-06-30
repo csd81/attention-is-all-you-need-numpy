@@ -276,9 +276,12 @@ class EncoderLayer(Layer):
         self.ffn = PositionwiseFFN(d_model, d_ff)
         self.norm1 = LayerNorm(d_model)
         self.norm2 = LayerNorm(d_model)
+        self._attn_store = None  # for capturing attention weights
 
     def forward(self, x, mask=None):
-        attn_out, _ = self.self_attn.forward(x, x, x, mask)
+        attn_out, attn_w = self.self_attn.forward(x, x, x, mask)
+        if self._attn_store is not None:
+            self._attn_store.append(attn_w)  # (B, h, L, L)
         x = self.norm1.forward(x + attn_out)
         x = self.norm2.forward(x + self.ffn.forward(x))
         return x
@@ -307,16 +310,21 @@ class DecoderLayer(Layer):
         self.norm2 = LayerNorm(d_model)
         self.norm3 = LayerNorm(d_model)
         self._d_enc_out = None  # accumulated encoder gradient
+        self._attn_store = None  # for capturing attention weights
 
     def forward(self, x, enc_out, src_mask=None, tgt_mask=None):
         self._enc_out = enc_out
         self._src_mask = src_mask
         self._d_enc_out = None
 
-        attn_out, _ = self.self_attn.forward(x, x, x, tgt_mask)
+        attn_out, attn_w = self.self_attn.forward(x, x, x, tgt_mask)
+        if self._attn_store is not None:
+            self._attn_store.append(attn_w)  # decoder self-attention
         x = self.norm1.forward(x + attn_out)
 
-        attn_out, _ = self.cross_attn.forward(x, enc_out, enc_out, src_mask)
+        attn_out, attn_w = self.cross_attn.forward(x, enc_out, enc_out, src_mask)
+        if self._attn_store is not None:
+            self._attn_store.append(attn_w)  # decoder cross-attention
         x = self.norm2.forward(x + attn_out)
 
         x = self.norm3.forward(x + self.ffn.forward(x))
@@ -350,11 +358,17 @@ class Encoder(Layer):
         self.embed = Embedding(vocab_size, d_model, weight=shared_weight)
         self.layers = [EncoderLayer(d_model, d_ff, h) for _ in range(N)]
 
-    def forward(self, x, mask=None):
+    def forward(self, x, mask=None, capture_attn=False):
         x = self.embed.forward(x) * math.sqrt(self.embed.w.shape[1])
-        # Sinusoidal positional encoding (fixed)
         pe = self._make_pe(x.shape[1], x.shape[2])
         x = x + pe
+        if capture_attn:
+            store = []
+            for layer in self.layers:
+                layer._attn_store = store
+                x = layer.forward(x, mask)
+                layer._attn_store = None
+            return x, {'self_attn': store}
         for layer in self.layers:
             x = layer.forward(x, mask)
         return x
@@ -381,10 +395,20 @@ class Decoder(Layer):
         self.embed = Embedding(vocab_size, d_model, weight=shared_weight)
         self.layers = [DecoderLayer(d_model, d_ff, h) for _ in range(N)]
 
-    def forward(self, x, enc_out, src_mask=None, tgt_mask=None):
+    def forward(self, x, enc_out, src_mask=None, tgt_mask=None, capture_attn=False):
         x = self.embed.forward(x) * math.sqrt(self.embed.w.shape[1])
         pe = self._make_pe(x.shape[1], x.shape[2])
         x = x + pe
+        if capture_attn:
+            store = []
+            for layer in self.layers:
+                layer._attn_store = store
+                x = layer.forward(x, enc_out, src_mask, tgt_mask)
+                layer._attn_store = None
+            # store: [self_attn_0, cross_attn_0, self_attn_1, cross_attn_1, ...]
+            self_attn = store[0::2]   # even indices
+            cross_attn = store[1::2]  # odd indices
+            return x, {'self_attn': self_attn, 'cross_attn': cross_attn}
         for layer in self.layers:
             x = layer.forward(x, enc_out, src_mask, tgt_mask)
         return x
@@ -428,6 +452,21 @@ class Transformer(Layer):
         logits = self.proj.forward(dec_out)
         self._cache = (src, tgt, src_mask, tgt_mask)
         return logits
+
+    def forward_with_attention(self, src, tgt, src_mask=None, tgt_mask=None):
+        """Forward pass that also returns all attention weights.
+
+        Returns:
+            logits: (B, T, vocab) output logits
+            attentions: dict with keys 'encoder' and 'decoder', each containing
+                       lists of (B, h, seq, seq) attention weight arrays.
+        """
+        enc_out, enc_attn = self.encoder.forward(
+            src, src_mask, capture_attn=True)
+        dec_out, dec_attn = self.decoder.forward(
+            tgt, enc_out, src_mask, tgt_mask, capture_attn=True)
+        logits = self.proj.forward(dec_out)
+        return logits, {'encoder': enc_attn, 'decoder': dec_attn}
 
     def backward(self, dlogits):
         ddec = self.proj.backward(dlogits)

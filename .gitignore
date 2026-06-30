@@ -27,5 +27,8 @@ Thumbs.db
 *.safetensors
 *.bin
 
+# Generated plots
+attn_demo_*.png
+
 # Large binaries
 *.exe
