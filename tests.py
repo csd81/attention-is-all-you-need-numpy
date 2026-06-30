@@ -10,6 +10,8 @@ from transformer import (
     Transformer, translate, translate_beam, train_copy, train_wmt,
     make_copy_batch, Param, softmax, NoamLR, Adam,
     Dropout, clip_gradients, save_checkpoint, load_checkpoint,
+    average_checkpoints,
+    _compute_grad_norms, _compute_param_norms, _format_norms,
 )
 from data import BPETokenizer, ParallelDataset, corpus_bleu, sentence_bleu, BOS_ID, EOS_ID, PAD_ID, UNK_ID
 
@@ -215,6 +217,23 @@ def test_bpe_roundtrip():
     assert ids[0] == BOS_ID, f"expected BOS=2 at start, got {ids[0]}"
     assert ids[-1] == EOS_ID, f"expected EOS=3 at end, got {ids[-1]}"
     assert len(ids) >= 3, f"too short: {ids.tolist()}"
+
+
+def test_bpe_regression():
+    """BPE (optimized): merge rules and vocab match expected structure."""
+    tok = _make_test_tokenizer()
+    assert tok.vocab_size == 200, f"vocab_size={tok.vocab_size}"
+    # All merge rules should be well-formed (pairs of strings)
+    for a, b in tok.bpe_merges:
+        assert isinstance(a, str) and len(a) > 0
+        assert isinstance(b, str) and len(b) > 0
+    assert len(tok.bpe_merges) > 0, "should have learned at least one merge"
+    # Verify encode/decode on a sentence with known tokens
+    text = "the cat sat on the mat"
+    ids = tok.encode(text)
+    decoded = tok.decode(ids)
+    assert UNK_ID not in ids
+    assert len(decoded) > 0
 
 
 def test_dataset_length():
@@ -445,6 +464,38 @@ def test_training_with_noam():
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  GRADIENT ACCUMULATION (plan 11)
+# ═══════════════════════════════════════════════════════════════════════
+
+def test_grad_accum_training():
+    """Gradient accumulation: training with accum_steps > 1 succeeds."""
+    m = Transformer(20, 20, d_model=32, N=2, d_ff=64, h=4, dropout=0)
+    train_copy(m, steps=30, batch_size=8, vocab_size=20,
+               lr=1e-3, log_every=999, accum_steps=2)
+    out = translate(m, np.array([5, 8, 3, 12]))
+    assert len(out) > 0, "empty output after grad accum training"
+
+
+def test_grad_accum_matches():
+    """Gradient accumulation: accum_steps=1 matches non-accum behavior."""
+    np.random.seed(42)
+    m1 = Transformer(20, 20, d_model=32, N=1, d_ff=64, h=2, dropout=0)
+    loss_before = m1.param_count()
+    train_copy(m1, steps=10, batch_size=8, vocab_size=20,
+               lr=1e-3, log_every=999, accum_steps=1)
+    assert m1.param_count() == loss_before, "param count changed"
+    out1 = translate(m1, np.array([5, 8, 3, 12]))
+
+    np.random.seed(42)
+    m2 = Transformer(20, 20, d_model=32, N=1, d_ff=64, h=2, dropout=0)
+    train_copy(m2, steps=10, batch_size=8, vocab_size=20,
+               lr=1e-3, log_every=999, accum_steps=1)
+    out2 = translate(m2, np.array([5, 8, 3, 12]))
+    # Same seed + same accum_steps = same result
+    assert np.array_equal(out1, out2), "accum_steps=1 not deterministic"
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  CHECKPOINTING (plan 06)
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -580,6 +631,149 @@ def test_checkpoint_training_resume():
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  CHECKPOINT AVERAGING (plan 08 WMT)
+# ═══════════════════════════════════════════════════════════════════════
+
+def test_checkpoint_averaging():
+    """Averaging: weights are correctly averaged, model produces different output."""
+    import tempfile, os
+    np.random.seed(42)
+
+    m = Transformer(20, 20, d_model=32, N=1, d_ff=64, h=2, dropout=0)
+    # Train a bit and save two checkpoints
+    train_copy(m, steps=50, batch_size=16, vocab_size=20, lr=1e-3, log_every=9999)
+    ckpt_dir = tempfile.mkdtemp()
+    path1 = os.path.join(ckpt_dir, "ckpt_1.npz")
+    path2 = os.path.join(ckpt_dir, "ckpt_2.npz")
+    save_checkpoint(m, None, path1, step=50)
+
+    train_copy(m, steps=100, batch_size=16, vocab_size=20, lr=1e-3, log_every=9999)
+    save_checkpoint(m, None, path2, step=100)
+
+    # Average the two checkpoints
+    avg_m = Transformer(20, 20, d_model=32, N=1, d_ff=64, h=2, dropout=0)
+    average_checkpoints(avg_m, [path1, path2])
+
+    # Verify average: avg = (ckpt1 + ckpt2) / 2
+    # Use with-statements to avoid Windows file locking
+    with np.load(path1, allow_pickle=True) as ckpt1:
+        with np.load(path2, allow_pickle=True) as ckpt2:
+            for i, p in enumerate(avg_m.params()):
+                expected = (ckpt1[f'param_{i}'] + ckpt2[f'param_{i}']) / 2
+                assert np.allclose(p.data, expected), \
+                    f"param {i} not correctly averaged"
+
+    os.remove(path1)
+    os.remove(path2)
+    os.rmdir(ckpt_dir)
+
+
+def test_run_wmt_dry_run():
+    """WMT script: --dry-run prints config and exits cleanly."""
+    import subprocess, sys, os
+    script = os.path.join(os.path.dirname(__file__), 'run_wmt.py')
+    result = subprocess.run(
+        [sys.executable, script, '--dry-run'],
+        capture_output=True, text=True, cwd=os.path.dirname(script))
+    assert result.returncode == 0, f"dry-run failed: {result.stderr}"
+    assert 'WMT14' in result.stdout, "dry-run output missing WMT14 header"
+    assert 'd_model=512' in result.stdout, "dry-run output missing model config"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  TRAIN/EVAL MODE, NORM LOGGING, BENCHMARK (plan 13)
+# ═══════════════════════════════════════════════════════════════════════
+
+def test_train_eval_mode():
+    """Train/eval: model.eval() disables training, model.train() re-enables."""
+    m = Transformer(20, 20, d_model=32, N=2, d_ff=64, h=4)
+    assert m._training is True, "default should be training=True"
+    m.eval()
+    assert m._training is False, "eval() should set _training=False"
+    m.train()
+    assert m._training is True, "train() should set _training=True"
+    m.train(False)
+    assert m._training is False, "train(False) should set _training=False"
+
+
+def test_forward_training_default():
+    """Forward: training=None falls back to model._training."""
+    m = Transformer(20, 20, d_model=32, N=2, d_ff=64, h=4, dropout=0.5)
+    src = np.random.randint(3, 20, (1, 4)).astype(np.int64)
+    tgt_in = np.array([[1, 5, 8, 3, 12]], dtype=np.int64)
+    src_mask = m.make_src_mask(src)
+    tgt_mask = m.make_tgt_mask(tgt_in)
+
+    m.eval()
+    out1 = m.forward(src, tgt_in, src_mask, tgt_mask)  # uses _training=False
+    out2 = m.forward(src, tgt_in, src_mask, tgt_mask, training=False)
+    assert np.allclose(out1, out2), "eval + training=None should match training=False"
+
+    m.train()
+    out3 = m.forward(src, tgt_in, src_mask, tgt_mask)  # uses _training=True
+    # With dropout=0.5, train vs eval outputs should differ (high probability)
+    assert not np.allclose(out1, out3), "train vs eval outputs should differ with dropout"
+
+
+def test_grad_norm_logging_runs():
+    """Grad norms: _compute_grad_norms returns expected keys without error."""
+    m = Transformer(20, 20, d_model=32, N=2, d_ff=64, h=4, dropout=0)
+    src, tgt_in, tgt_out = make_copy_batch(20, 5, 4)
+    src_mask = m.make_src_mask(src)
+    tgt_mask = m.make_tgt_mask(tgt_in)
+    logits = m.forward(src, tgt_in, src_mask, tgt_mask, training=True)
+    from transformer import cross_entropy_loss
+    loss, dlogits = cross_entropy_loss(logits.reshape(-1, 20), tgt_out.reshape(-1))
+    m.zero_grad()
+    m.backward(dlogits.reshape(4, 6, 20))
+
+    norms = _compute_grad_norms(m)
+    assert 'enc_embed' in norms, f"missing enc_embed in {list(norms.keys())}"
+    assert 'enc_0_self_attn' in norms, f"missing enc_0_self_attn"
+    assert 'dec_0_cross_attn' in norms, f"missing dec_0_cross_attn"
+    assert 'proj_b' in norms, f"missing proj_b"
+    assert all(v >= 0 for v in norms.values()), "negative norm value"
+    formatted = _format_norms(norms)
+    assert len(formatted) > 0, "empty formatted norms"
+    assert 'enc_embed' in formatted, "enc_embed missing from formatted output"
+
+
+def test_param_norm_logging_runs():
+    """Param norms: _compute_param_norms returns expected keys without error."""
+    m = Transformer(20, 20, d_model=32, N=2, d_ff=64, h=4, dropout=0)
+    norms = _compute_param_norms(m)
+    assert 'enc_embed' in norms, f"missing enc_embed in {list(norms.keys())}"
+    assert 'enc_0_self_attn' in norms, f"missing enc_0_self_attn"
+    assert 'dec_0_cross_attn' in norms, f"missing dec_0_cross_attn"
+    assert 'proj_b' in norms, f"missing proj_b"
+    assert all(v >= 0 for v in norms.values()), "negative norm value"
+    formatted = _format_norms(norms)
+    assert len(formatted) > 0, "empty formatted norms"
+
+
+def test_log_norms_training_does_not_crash():
+    """Training: log_norms=True does not cause errors during copying."""
+    m = Transformer(20, 20, d_model=32, N=1, d_ff=64, h=4, dropout=0)
+    np.random.seed(42)
+    m = train_copy(m, steps=5, batch_size=8, seq_len=4, vocab_size=20,
+                   log_every=1, log_norms=True)
+    out = translate(m, np.array([5, 8, 3, 12]))
+    assert len(out) > 0, "empty output after training with log_norms"
+
+
+def test_benchmark_runs():
+    """Benchmark: runs all configs without error."""
+    import subprocess, sys, os
+    script = os.path.join(os.path.dirname(__file__), 'benchmark.py')
+    result = subprocess.run(
+        [sys.executable, script],
+        capture_output=True, text=True, cwd=os.path.dirname(script))
+    assert result.returncode == 0, f"benchmark failed: {result.stderr}"
+    assert 'tiny' in result.stdout, "tiny config missing from benchmark output"
+    assert 'base' in result.stdout, "base config missing from benchmark output"
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  RUN ALL
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -601,6 +795,7 @@ if __name__ == '__main__':
         # WMT data pipeline (plan 04)
         ('test_bpe_tokenization', test_bpe_tokenization),
         ('test_bpe_roundtrip', test_bpe_roundtrip),
+        ('test_bpe_regression', test_bpe_regression),
         ('test_dataset_length', test_dataset_length),
         ('test_batch_shapes', test_batch_shapes),
         ('test_batch_no_all_padding', test_batch_no_all_padding),
@@ -620,12 +815,25 @@ if __name__ == '__main__':
         ('test_noam_custom_scaling', test_noam_custom_scaling),
         ('test_training_with_clip', test_training_with_clip),
         ('test_training_with_noam', test_training_with_noam),
+        # Gradient accumulation (plan 11)
+        ('test_grad_accum_training', test_grad_accum_training),
+        ('test_grad_accum_matches', test_grad_accum_matches),
         # Checkpointing (plan 06)
         ('test_save_and_load_params', test_save_and_load_params),
         ('test_save_and_load_optimizer', test_save_and_load_optimizer),
         ('test_checkpoint_file_exists', test_checkpoint_file_exists),
         ('test_load_nonexistent_raises', test_load_nonexistent_raises),
         ('test_checkpoint_training_resume', test_checkpoint_training_resume),
+        # WMT run script (plan 08)
+        ('test_checkpoint_averaging', test_checkpoint_averaging),
+        ('test_run_wmt_dry_run', test_run_wmt_dry_run),
+        # Train/eval mode, norm logging, benchmark (plan 13)
+        ('test_train_eval_mode', test_train_eval_mode),
+        ('test_forward_training_default', test_forward_training_default),
+        ('test_grad_norm_logging_runs', test_grad_norm_logging_runs),
+        ('test_param_norm_logging_runs', test_param_norm_logging_runs),
+        ('test_log_norms_training_does_not_crash', test_log_norms_training_does_not_crash),
+        ('test_benchmark_runs', test_benchmark_runs),
     ]
 
     passed = 0

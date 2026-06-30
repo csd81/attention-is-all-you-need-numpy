@@ -41,7 +41,7 @@ class BPETokenizer:
         self.bpe_merges = []        # list of (a, b) merge rules in order
         self._word_to_bpe_cache = {}  # cache for word -> BPE encoding
 
-        if model_path and os.path.exists(model_path):
+        if model_path and os.path.exists(model_path + '.merges'):
             self.load(model_path)
 
     def _get_char_vocab(self, texts):
@@ -75,13 +75,16 @@ class BPETokenizer:
 
     def _train_from_text(self, text, vocab_size):
         """
-        Train BPE from raw text string.
+        Train BPE from raw text string (incremental pair counting).
 
         Algorithm:
         1. Start with character vocabulary
         2. Count adjacent symbol pairs
         3. Merge the most frequent pair
         4. Repeat until vocab_size is reached
+
+        Uses incremental pair counting: only re-counts pairs in words
+        affected by each merge, avoiding O(V × W) full scans.
         """
         # Preprocess: split into words with end-of-word marker
         words = text.strip().split()
@@ -89,12 +92,11 @@ class BPETokenizer:
         word_freqs = Counter(words)
 
         # Start with character-level tokenization of each word
-        # Each word is represented as a tuple of symbols (chars) + </w>
-        self._word_to_bpe = {}
+        word_symbols = {}
         char_vocab = set()
         for word in word_freqs:
             symbols = list(word) + ['</w>']
-            self._word_to_bpe[word] = symbols
+            word_symbols[word] = symbols
             for s in symbols:
                 char_vocab.add(s)
 
@@ -112,17 +114,20 @@ class BPETokenizer:
                 next_id += 1
 
         self.bpe_merges = []
-        current_vocab_size = len(self.token_to_id)
 
-        while current_vocab_size < vocab_size:
-            # Count all adjacent pairs
-            pair_counts = Counter()
-            for word, freq in word_freqs.items():
-                symbols = self._word_to_bpe[word]
-                for i in range(len(symbols) - 1):
-                    pair = (symbols[i], symbols[i + 1])
-                    pair_counts[pair] += freq
+        # Initialize incremental pair counts + pair→words mapping
+        pair_counts = Counter()
+        pair_to_words = {}  # (a,b) -> set of words
+        for word, freq in word_freqs.items():
+            syms = word_symbols[word]
+            for i in range(len(syms) - 1):
+                pair = (syms[i], syms[i + 1])
+                pair_counts[pair] += freq
+                if pair not in pair_to_words:
+                    pair_to_words[pair] = set()
+                pair_to_words[pair].add(word)
 
+        while len(self.token_to_id) < vocab_size:
             if not pair_counts:
                 break
 
@@ -138,25 +143,51 @@ class BPETokenizer:
 
             self.bpe_merges.append(best_pair)
 
-            # Apply merge to all words
-            for word in self._word_to_bpe:
-                symbols = self._word_to_bpe[word]
-                new_symbols = []
+            # Process only words that contain the best pair
+            affected = list(pair_to_words.get(best_pair, set()))
+            for word in affected:
+                freq = word_freqs[word]
+                old_syms = word_symbols[word]
+
+                # Remove old pair counts for this word
+                for i in range(len(old_syms) - 1):
+                    pair = (old_syms[i], old_syms[i + 1])
+                    pair_counts[pair] -= freq
+                    ps = pair_to_words.get(pair)
+                    if ps:
+                        ps.discard(word)
+                        if not ps:
+                            del pair_to_words[pair]
+
+                # Apply merge to this word
+                new_syms = []
                 i = 0
-                while i < len(symbols):
-                    if (i < len(symbols) - 1
-                            and symbols[i] == best_pair[0]
-                            and symbols[i + 1] == best_pair[1]):
-                        new_symbols.append(merged_token)
+                while i < len(old_syms):
+                    if (i < len(old_syms) - 1
+                            and old_syms[i] == best_pair[0]
+                            and old_syms[i + 1] == best_pair[1]):
+                        new_syms.append(merged_token)
                         i += 2
                     else:
-                        new_symbols.append(symbols[i])
+                        new_syms.append(old_syms[i])
                         i += 1
-                self._word_to_bpe[word] = new_symbols
+                word_symbols[word] = new_syms
 
-            current_vocab_size = next_id
+                # Add new pair counts for this word
+                for i in range(len(new_syms) - 1):
+                    pair = (new_syms[i], new_syms[i + 1])
+                    pair_counts[pair] += freq
+                    if pair not in pair_to_words:
+                        pair_to_words[pair] = set()
+                    pair_to_words[pair].add(word)
+
+            # Clean up pairs whose count dropped to zero
+            dead = [p for p, c in pair_counts.items() if c <= 0]
+            for p in dead:
+                del pair_counts[p]
 
         self.vocab_size = len(self.id_to_token)
+        self._word_to_bpe = word_symbols
         # Clear the word->bpe cache
         self._word_to_bpe_cache = {}
 

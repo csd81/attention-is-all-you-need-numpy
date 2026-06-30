@@ -178,11 +178,8 @@ class Embedding(Layer):
         return self.w.data[indices]
 
     def backward(self, dout):
-        """Accumulate gradients at the positions used in forward."""
-        for i in range(self._indices.shape[0]):
-            for j in range(self._indices.shape[1]):
-                idx = self._indices[i, j]
-                self.w.grad[idx] += dout[i, j]
+        """Accumulate gradients at the positions used in forward (vectorized)."""
+        np.add.at(self.w.grad, self._indices, dout)
         return None  # no gradient to input indices
 
 
@@ -486,9 +483,19 @@ class Transformer(Layer):
                                shared_weight=shared, dropout=dropout)
         # proj uses shared weight transposed: y = x @ W^T + b
         self.proj = Linear(d_model, tgt_vocab, weight=shared, transpose_w=True)
+        self._training = True
         self._cache = None
 
-    def forward(self, src, tgt, src_mask=None, tgt_mask=None, training=True):
+    def train(self, mode=True):
+        self._training = mode
+        return self
+
+    def eval(self):
+        return self.train(False)
+
+    def forward(self, src, tgt, src_mask=None, tgt_mask=None, training=None):
+        if training is None:
+            training = self._training
         enc_out = self.encoder.forward(src, src_mask, training=training)
         dec_out = self.decoder.forward(tgt, enc_out, src_mask, tgt_mask, training=training)
         logits = self.proj.forward(dec_out)
@@ -528,6 +535,66 @@ class Transformer(Layer):
 # ═══════════════════════════════════════════════════════════════════════
 #  TRAINING
 # ═══════════════════════════════════════════════════════════════════════
+
+def _euclidean_norm(params, attr='grad'):
+    """Compute L2 norm of concatenated gradients/data from a list of Param objects."""
+    total = sum((getattr(p, attr) ** 2).sum() for p in params)
+    return math.sqrt(float(total))
+
+
+def _layer_params(layer):
+    """Yield all Param objects in a layer (no dedup needed for non-shared layers)."""
+    for attr in layer.__dict__.values():
+        if isinstance(attr, Param):
+            yield attr
+
+
+def _compute_grad_norms(model):
+    """Return dict of gradient L2 norms per major component."""
+    norms = {}
+    norms['enc_embed'] = float(np.linalg.norm(model.encoder.embed.w.grad))
+    for i, layer in enumerate(model.encoder.layers):
+        norms[f'enc_{i}_self_attn'] = _euclidean_norm(list(_layer_params(layer.self_attn)))
+        norms[f'enc_{i}_ffn'] = _euclidean_norm(list(_layer_params(layer.ffn)))
+        norms[f'enc_{i}_norm1'] = _euclidean_norm(list(_layer_params(layer.norm1)))
+        norms[f'enc_{i}_norm2'] = _euclidean_norm(list(_layer_params(layer.norm2)))
+    norms['dec_embed'] = float(np.linalg.norm(model.decoder.embed.w.grad))
+    for i, layer in enumerate(model.decoder.layers):
+        norms[f'dec_{i}_self_attn'] = _euclidean_norm(list(_layer_params(layer.self_attn)))
+        norms[f'dec_{i}_cross_attn'] = _euclidean_norm(list(_layer_params(layer.cross_attn)))
+        norms[f'dec_{i}_ffn'] = _euclidean_norm(list(_layer_params(layer.ffn)))
+        norms[f'dec_{i}_norm1'] = _euclidean_norm(list(_layer_params(layer.norm1)))
+        norms[f'dec_{i}_norm2'] = _euclidean_norm(list(_layer_params(layer.norm2)))
+        norms[f'dec_{i}_norm3'] = _euclidean_norm(list(_layer_params(layer.norm3)))
+    norms['proj_b'] = float(np.linalg.norm(model.proj.b.grad))
+    return norms
+
+
+def _compute_param_norms(model):
+    """Return dict of parameter L2 norms per major component."""
+    norms = {}
+    norms['enc_embed'] = float(np.linalg.norm(model.encoder.embed.w.data))
+    for i, layer in enumerate(model.encoder.layers):
+        norms[f'enc_{i}_self_attn'] = _euclidean_norm(list(_layer_params(layer.self_attn)), attr='data')
+        norms[f'enc_{i}_ffn'] = _euclidean_norm(list(_layer_params(layer.ffn)), attr='data')
+        norms[f'enc_{i}_norm1'] = _euclidean_norm(list(_layer_params(layer.norm1)), attr='data')
+        norms[f'enc_{i}_norm2'] = _euclidean_norm(list(_layer_params(layer.norm2)), attr='data')
+    norms['dec_embed'] = float(np.linalg.norm(model.decoder.embed.w.data))
+    for i, layer in enumerate(model.decoder.layers):
+        norms[f'dec_{i}_self_attn'] = _euclidean_norm(list(_layer_params(layer.self_attn)), attr='data')
+        norms[f'dec_{i}_cross_attn'] = _euclidean_norm(list(_layer_params(layer.cross_attn)), attr='data')
+        norms[f'dec_{i}_ffn'] = _euclidean_norm(list(_layer_params(layer.ffn)), attr='data')
+        norms[f'dec_{i}_norm1'] = _euclidean_norm(list(_layer_params(layer.norm1)), attr='data')
+        norms[f'dec_{i}_norm2'] = _euclidean_norm(list(_layer_params(layer.norm2)), attr='data')
+        norms[f'dec_{i}_norm3'] = _euclidean_norm(list(_layer_params(layer.norm3)), attr='data')
+    norms['proj_b'] = float(np.linalg.norm(model.proj.b.grad))
+    return norms
+
+
+def _format_norms(norms):
+    """Format norm dict into a compact log string."""
+    return '  '.join(f'{k} {v:.4f}' for k, v in sorted(norms.items()))
+
 
 class NoamLR:
     """Noam learning rate schedule (Section 5.3, Figure 2).
@@ -622,6 +689,42 @@ def load_checkpoint(model, optimizer, path):
     return state
 
 
+def average_checkpoints(model, checkpoint_paths):
+    """
+    Average model parameters from multiple checkpoints (Section 5.4).
+
+    The paper averages the last 5 checkpoints saved at 10-minute intervals.
+    This function loads each checkpoint, sums the weights, then divides by count.
+
+    Args:
+        model: Transformer instance (used for param structure)
+        checkpoint_paths: list of checkpoint file paths
+
+    Returns:
+        model with averaged weights (in-place)
+    """
+    n = len(checkpoint_paths)
+    if n == 0:
+        return model
+
+    # Initialize with first checkpoint
+    with np.load(checkpoint_paths[0], allow_pickle=True) as state:
+        for i, p in enumerate(model.params()):
+            p.data[:] = state[f'param_{i}']
+
+    # Accumulate remaining checkpoints
+    for path in checkpoint_paths[1:]:
+        with np.load(path, allow_pickle=True) as state:
+            for i, p in enumerate(model.params()):
+                p.data[:] += state[f'param_{i}']
+
+    # Divide by count
+    for p in model.params():
+        p.data /= n
+
+    return model
+
+
 def softmax(x, axis=-1):
     x_max = x.max(axis=axis, keepdims=True)
     exp = np.exp(x - x_max)
@@ -664,7 +767,7 @@ def make_copy_batch(vocab_size, seq_len, batch_size, bos_idx=1, eos_idx=2):
 def train_copy(model, steps=500, batch_size=16, seq_len=5, vocab_size=20,
                lr=1e-3, log_every=100, use_noam=False, clip_norm=0.0,
                d_model=32, warmup_steps=100, checkpoint_dir=None,
-               save_every=9999):
+               save_every=9999, accum_steps=1, log_norms=False):
     """
     Train on copy task with optional NoamLR, gradient clipping, checkpointing.
 
@@ -674,6 +777,7 @@ def train_copy(model, steps=500, batch_size=16, seq_len=5, vocab_size=20,
         clip_norm: max gradient norm (0 = no clipping)
         checkpoint_dir: if set, save checkpoints here
         save_every: save checkpoint every N steps
+        accum_steps: accumulate gradients over N micro-batches per step
     """
     opt = Adam(model.params(), lr=lr)
     lr_schedule = NoamLR(d_model=d_model, warmup_steps=warmup_steps) if use_noam else None
@@ -683,39 +787,57 @@ def train_copy(model, steps=500, batch_size=16, seq_len=5, vocab_size=20,
         if use_noam:
             opt.lr = lr_schedule(step)
 
-        src_np, tgt_in_np, tgt_out_np = make_copy_batch(vocab_size, seq_len, batch_size)
-
-        src_mask = model.make_src_mask(src_np)
-        tgt_mask = model.make_tgt_mask(tgt_in_np)
-
-        logits = model.forward(src_np, tgt_in_np, src_mask, tgt_mask, training=True)
-        B, L, C = logits.shape
-
-        loss, dlogits = cross_entropy_loss(
-            logits.reshape(-1, C), tgt_out_np.reshape(-1),
-            smoothing=0.1)
-
+        total_loss = 0.0
+        total_correct = 0
+        total_tokens = 0
         model.zero_grad()
-        model.backward(dlogits.reshape(B, L, C))
+
+        for micro in range(accum_steps):
+            src_np, tgt_in_np, tgt_out_np = make_copy_batch(
+                vocab_size, seq_len, batch_size)
+
+            src_mask = model.make_src_mask(src_np)
+            tgt_mask = model.make_tgt_mask(tgt_in_np)
+
+            logits = model.forward(src_np, tgt_in_np, src_mask, tgt_mask,
+                                   training=True)
+            B, L, C = logits.shape
+
+            loss, dlogits = cross_entropy_loss(
+                logits.reshape(-1, C), tgt_out_np.reshape(-1),
+                smoothing=0.1)
+
+            model.backward(dlogits.reshape(B, L, C))
+
+            total_loss += loss
+            preds = logits.argmax(axis=-1)
+            total_correct += (preds == tgt_out_np).sum()
+            total_tokens += tgt_out_np.size
+
+        # Average accumulated gradients
+        if accum_steps > 1:
+            for p in model.params():
+                p.grad /= accum_steps
 
         grad_norm = clip_gradients(model, max_norm=clip_norm) if clip_norm > 0 else 0.0
         opt.step()
 
         if step % log_every == 0 or step == 1:
-            preds = logits.argmax(axis=-1)
-            correct = (preds == tgt_out_np).sum()
-            total = tgt_out_np.size
-            acc = correct / total * 100
+            avg_loss = total_loss / accum_steps
+            avg_acc = total_correct / total_tokens * 100
+            ppl = math.exp(avg_loss)
             gn = f"  grad_norm {grad_norm:.2f}" if clip_norm > 0 else ""
-            print(f"step {step:4d}  loss {loss:.4f}  acc {acc:.1f}%  "
-                  f"lr {opt.lr:.2e}{gn}")
+            if log_norms:
+                gn += '  grad  ' + _format_norms(_compute_grad_norms(model))
+                gn += '  param  ' + _format_norms(_compute_param_norms(model))
+            print(f"step {step:4d}  loss {avg_loss:.4f}  ppl {ppl:.2f}  "
+                  f"acc {avg_acc:.1f}%  lr {opt.lr:.2e}{gn}")
 
         if checkpoint_dir and step % save_every == 0:
             ckpt_path = os.path.join(checkpoint_dir, f'checkpoint_step_{step:06d}.npz')
-            save_checkpoint(model, opt, ckpt_path, step=step, loss=loss)
-            # Also overwrite latest
+            save_checkpoint(model, opt, ckpt_path, step=step, loss=avg_loss)
             latest_path = os.path.join(checkpoint_dir, 'checkpoint_latest.npz')
-            save_checkpoint(model, opt, latest_path, step=step, loss=loss)
+            save_checkpoint(model, opt, latest_path, step=step, loss=avg_loss)
 
     return model
 
@@ -723,7 +845,7 @@ def train_copy(model, steps=500, batch_size=16, seq_len=5, vocab_size=20,
 def train_wmt(model, dataset, steps=10000, batch_size=32, d_model=512,
                warmup_steps=4000, log_every=100, eval_every=500,
                tokenizer=None, dev_dataset=None, clip_norm=0.0,
-               checkpoint_dir=None, save_every=1000):
+               checkpoint_dir=None, save_every=1000, accum_steps=1, log_norms=False):
     """
     Training loop for parallel text with NoamLR, clipping, and checkpointing.
 
@@ -731,6 +853,7 @@ def train_wmt(model, dataset, steps=10000, batch_size=32, d_model=512,
         clip_norm: max gradient norm (0 = no clipping)
         checkpoint_dir: if set, save checkpoints here
         save_every: save checkpoint every N steps
+        accum_steps: accumulate gradients over N micro-batches per step
     """
     opt = Adam(model.params(), lr=1.0)  # lr overridden by NoamLR
     lr_schedule = NoamLR(d_model=d_model, warmup_steps=warmup_steps)
@@ -746,45 +869,72 @@ def train_wmt(model, dataset, steps=10000, batch_size=32, d_model=512,
             print(f"  Resumed at step {start_step}")
 
     step = start_step
+    epoch = 0
     while step < steps:
-        for src, tgt_in, tgt_out in dataset.batches(batch_size=batch_size):
+        epoch += 1
+        it = iter(dataset.batches(batch_size=batch_size))
+        for src, tgt_in, tgt_out in it:
             step += 1
             opt.lr = lr_schedule(step)
 
-            src_mask = model.make_src_mask(src)
-            tgt_mask = model.make_tgt_mask(tgt_in)
-
-            logits = model.forward(src, tgt_in, src_mask, tgt_mask, training=True)
-            B, L, C = logits.shape
-
-            loss, dlogits = cross_entropy_loss(
-                logits.reshape(-1, C), tgt_out.reshape(-1),
-                smoothing=0.1)
-
+            total_loss = 0.0
+            total_correct = 0
+            total_tokens = 0
             model.zero_grad()
-            model.backward(dlogits.reshape(B, L, C))
+
+            for micro in range(accum_steps):
+                if micro > 0:
+                    try:
+                        src, tgt_in, tgt_out = next(it)
+                    except StopIteration:
+                        break
+
+                src_mask = model.make_src_mask(src)
+                tgt_mask = model.make_tgt_mask(tgt_in)
+
+                logits = model.forward(src, tgt_in, src_mask, tgt_mask,
+                                       training=True)
+                B, L, C = logits.shape
+
+                loss, dlogits = cross_entropy_loss(
+                    logits.reshape(-1, C), tgt_out.reshape(-1),
+                    smoothing=0.1)
+
+                model.backward(dlogits.reshape(B, L, C))
+
+                total_loss += loss
+                preds = logits.argmax(axis=-1)
+                mask = tgt_out != 0
+                total_correct += ((preds == tgt_out) & mask).sum()
+                total_tokens += mask.sum()
+
+            # Average accumulated gradients
+            if accum_steps > 1:
+                for p in model.params():
+                    p.grad /= accum_steps
 
             grad_norm = clip_gradients(model, max_norm=clip_norm) if clip_norm > 0 else 0.0
             opt.step()
 
             if step % log_every == 0 or step == 1:
-                preds = logits.argmax(axis=-1)
-                mask = tgt_out != 0
-                correct = ((preds == tgt_out) & mask).sum()
-                total = mask.sum()
-                acc = correct / max(total, 1) * 100
+                avg_loss = total_loss / accum_steps
+                avg_acc = total_correct / max(total_tokens, 1) * 100
+                ppl = math.exp(avg_loss)
                 gn = f"  grad_norm {grad_norm:.2f}" if clip_norm > 0 else ""
-                print(f"step {step:6d}  loss {loss:.4f}  acc {acc:.1f}%  "
-                      f"lr {opt.lr:.2e}{gn}")
+                if log_norms:
+                    gn += '  grad  ' + _format_norms(_compute_grad_norms(model))
+                    gn += '  param  ' + _format_norms(_compute_param_norms(model))
+                print(f"epoch {epoch}  step {step:6d}  loss {avg_loss:.4f}  ppl {ppl:.2f}  "
+                      f"acc {avg_acc:.1f}%  lr {opt.lr:.2e}{gn}")
 
             if step % eval_every == 0 and tokenizer is not None and dev_dataset is not None:
                 _eval_bleu(model, dev_dataset, tokenizer, step)
 
             if checkpoint_dir and step % save_every == 0:
                 ckpt_path = os.path.join(checkpoint_dir, f'checkpoint_step_{step:06d}.npz')
-                save_checkpoint(model, opt, ckpt_path, step=step, loss=loss)
+                save_checkpoint(model, opt, ckpt_path, step=step, loss=avg_loss)
                 latest_path = os.path.join(checkpoint_dir, 'checkpoint_latest.npz')
-                save_checkpoint(model, opt, latest_path, step=step, loss=loss)
+                save_checkpoint(model, opt, latest_path, step=step, loss=avg_loss)
 
             if step >= steps:
                 break
@@ -792,7 +942,7 @@ def train_wmt(model, dataset, steps=10000, batch_size=32, d_model=512,
     # Save final checkpoint
     if checkpoint_dir:
         final_path = os.path.join(checkpoint_dir, 'checkpoint_final.npz')
-        save_checkpoint(model, opt, final_path, step=step, loss=loss)
+        save_checkpoint(model, opt, final_path, step=step, loss=avg_loss)
         print(f"  Saved final checkpoint: {final_path}")
 
     return model
