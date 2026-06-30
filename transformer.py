@@ -486,6 +486,25 @@ class Transformer(Layer):
 #  TRAINING
 # ═══════════════════════════════════════════════════════════════════════
 
+class NoamLR:
+    """Noam learning rate schedule (Section 5.3, Figure 2).
+
+    lrate = d_model^(-0.5) * min(step^(-0.5), step * warmup_steps^(-1.5))
+
+    Linear warmup for first warmup_steps, then inverse sqrt decay.
+    """
+    def __init__(self, d_model=512, warmup_steps=4000, factor=1.0):
+        self.d_model = d_model
+        self.warmup_steps = warmup_steps
+        self.factor = factor
+        self._scale = d_model ** (-0.5)
+
+    def __call__(self, step):
+        arg1 = step ** (-0.5)
+        arg2 = step * self.warmup_steps ** (-1.5)
+        return self.factor * self._scale * min(arg1, arg2)
+
+
 class Adam:
     """Adam optimizer (Section 5.3)."""
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.98), eps=1e-9):
@@ -577,6 +596,103 @@ def train_copy(model, steps=500, batch_size=16, seq_len=5, vocab_size=20,
                   f"lr {opt.lr:.2e}")
 
     return model
+
+
+def train_wmt(model, dataset, steps=10000, batch_size=32, d_model=512,
+               warmup_steps=4000, log_every=100, eval_every=500,
+               tokenizer=None, dev_dataset=None):
+    """
+    Training loop for parallel text with Noam learning rate schedule.
+
+    Args:
+        model: Transformer instance
+        dataset: ParallelDataset (yields src, tgt_in, tgt_out batches)
+        steps: total training steps
+        batch_size: batch size for each step
+        d_model: model dimension used in NoamLR scaling
+        warmup_steps: NoamLR warmup steps
+        log_every: print progress every N steps
+        eval_every: run dev BLEU every N steps
+        tokenizer: BPETokenizer (needed for BLEU eval)
+        dev_dataset: ParallelDataset for evaluation
+
+    Returns:
+        trained model
+    """
+    opt = Adam(model.params(), lr=1.0)  # lr overridden by NoamLR
+    lr_schedule = NoamLR(d_model=d_model, warmup_steps=warmup_steps)
+    step = 0
+
+    while step < steps:
+        for src, tgt_in, tgt_out in dataset.batches(batch_size=batch_size):
+            step += 1
+            opt.lr = lr_schedule(step)
+
+            src_mask = model.make_src_mask(src)
+            tgt_mask = model.make_tgt_mask(tgt_in)
+
+            logits = model.forward(src, tgt_in, src_mask, tgt_mask)
+            B, L, C = logits.shape
+
+            loss, dlogits = cross_entropy_loss(
+                logits.reshape(-1, C), tgt_out.reshape(-1),
+                smoothing=0.1)
+
+            model.zero_grad()
+            model.backward(dlogits.reshape(B, L, C))
+            opt.step()
+
+            if step % log_every == 0 or step == 1:
+                preds = logits.argmax(axis=-1)
+                mask = tgt_out != 0
+                correct = ((preds == tgt_out) & mask).sum()
+                total = mask.sum()
+                acc = correct / max(total, 1) * 100
+                print(f"step {step:6d}  loss {loss:.4f}  acc {acc:.1f}%  "
+                      f"lr {opt.lr:.2e}")
+
+            if step % eval_every == 0 and tokenizer is not None and dev_dataset is not None:
+                _eval_bleu(model, dev_dataset, tokenizer, step)
+
+            if step >= steps:
+                break
+
+    return model
+
+
+def _eval_bleu(model, dataset, tokenizer, step, max_samples=50):
+    """Translate dev set and compute BLEU."""
+    from data import corpus_bleu
+
+    hypotheses = []
+    references = []
+    count = 0
+
+    for src_batch, tgt_in_batch, tgt_out_batch in dataset.batches(batch_size=8, shuffle=False):
+        for i in range(src_batch.shape[0]):
+            if count >= max_samples:
+                break
+            src_tokens = src_batch[i]
+            # Strip padding
+            src_tokens = src_tokens[src_tokens != 0]
+            # Use greedy decoding
+            out_tokens = translate(model, src_tokens, bos_idx=2, eos_idx=3)
+
+            hyp_text = tokenizer.decode(out_tokens)
+            ref_tokens = tgt_out_batch[i]
+            ref_tokens = ref_tokens[ref_tokens != 0]
+            ref_text = tokenizer.decode(ref_tokens)
+
+            hypotheses.append(hyp_text)
+            references.append(ref_text)
+            count += 1
+        if count >= max_samples:
+            break
+
+    if hypotheses:
+        result = corpus_bleu(hypotheses, references)
+        print(f"  >>> step {step:6d}  dev BLEU {result['score']:.2f}  "
+              f"({len(hypotheses)} sentences)")
 
 
 def translate(model, src_np, max_len=30, bos_idx=1, eos_idx=2):

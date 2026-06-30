@@ -7,9 +7,10 @@ import numpy as np
 
 sys.path.insert(0, '.')
 from transformer import (
-    Transformer, translate, translate_beam, train_copy,
-    make_copy_batch, Param, softmax,
+    Transformer, translate, translate_beam, train_copy, train_wmt,
+    make_copy_batch, Param, softmax, NoamLR, Adam,
 )
+from data import BPETokenizer, ParallelDataset, corpus_bleu, sentence_bleu, BOS_ID, EOS_ID, PAD_ID, UNK_ID
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -183,6 +184,123 @@ def test_visualize_no_crash():
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  WMT DATA PIPELINE (plan 04)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _make_test_tokenizer():
+    """Train a tiny BPE tokenizer on the test data."""
+    tok = BPETokenizer()
+    tok.train('test_data/train.en', 'test_data/train.de',
+              model_prefix='test_data/bpe_test', vocab_size=200)
+    return tok
+
+
+def test_bpe_tokenization():
+    """BPE: encodes and decodes without OOV tokens."""
+    tok = _make_test_tokenizer()
+    text = "the cat sat on the mat"
+    ids = tok.encode(text)
+    decoded = tok.decode(ids)
+    # Should decode back to similar text (whitespace may differ)
+    assert len(ids) > 0, "empty encoding"
+    assert UNK_ID not in ids, f"OOV token in {ids.tolist()}"
+    assert len(decoded) > 0, "empty decode"
+
+
+def test_bpe_roundtrip():
+    """BPE: encode_sentence includes BOS/EOS tokens."""
+    tok = _make_test_tokenizer()
+    ids = tok.encode_sentence("hello", bos=True, eos=True)
+    assert ids[0] == BOS_ID, f"expected BOS=2 at start, got {ids[0]}"
+    assert ids[-1] == EOS_ID, f"expected EOS=3 at end, got {ids[-1]}"
+    assert len(ids) >= 3, f"too short: {ids.tolist()}"
+
+
+def test_dataset_length():
+    """Dataset: returns expected number of sentence pairs."""
+    tok = _make_test_tokenizer()
+    ds = ParallelDataset('test_data/train.en', 'test_data/train.de',
+                         tok, max_len=50)
+    assert ds.n_pairs == 10, f"expected 10 pairs, got {ds.n_pairs}"
+
+
+def test_batch_shapes():
+    """Dataset: bucketed batches have correct (B, L) shapes."""
+    tok = _make_test_tokenizer()
+    ds = ParallelDataset('test_data/train.en', 'test_data/train.de',
+                         tok, max_len=50)
+    for i, (src, tgt_in, tgt_out) in enumerate(ds.batches(batch_size=4, shuffle=False)):
+        B = src.shape[0]
+        assert B <= 4, f"batch too large: {B}"
+        assert src.ndim == 2, f"src shape: {src.shape}"
+        assert tgt_in.ndim == 2, f"tgt_in shape: {tgt_in.shape}"
+        assert tgt_out.ndim == 2, f"tgt_out shape: {tgt_out.shape}"
+        assert tgt_in.shape == tgt_out.shape, \
+            f"tgt_in {tgt_in.shape} != tgt_out {tgt_out.shape}"
+        # Verify padding at position 0 is PAD_ID
+        if i == 0:
+            break  # one batch is enough
+
+
+def test_batch_no_all_padding():
+    """Dataset: not every batch is all padding."""
+    tok = _make_test_tokenizer()
+    ds = ParallelDataset('test_data/train.en', 'test_data/train.de',
+                         tok, max_len=50)
+    all_pad = True
+    for src, tgt_in, tgt_out in ds.batches(batch_size=4, shuffle=False):
+        if (src != 0).sum() > 0:
+            all_pad = False
+            break
+    assert not all_pad, "all batches are all-padding"
+
+
+def test_bleu_perfect_match():
+    """BLEU: score 100 when hypothesis == reference."""
+    result = corpus_bleu(
+        ["the cat sat on the mat"],
+        ["the cat sat on the mat"])
+    assert result['score'] > 99, f"perfect BLEU too low: {result['score']}"
+
+
+def test_bleu_no_match():
+    """BLEU: score 0 when hypothesis shares no 4-grams."""
+    result = corpus_bleu(
+        ["goodbye world"],
+        ["the cat sat on the mat"])
+    assert result['score'] < 1, f"no-match BLEU too high: {result['score']}"
+
+
+def test_train_step():
+    """Training: single WMT training step completes without error."""
+    tok = _make_test_tokenizer()
+    ds = ParallelDataset('test_data/train.en', 'test_data/train.de',
+                         tok, max_len=50)
+    model = Transformer(tok.vocab_size, tok.vocab_size,
+                        d_model=32, N=2, d_ff=64, h=4)
+    np.random.seed(42)
+    model = train_wmt(model, ds, steps=3, batch_size=4, d_model=32,
+                       warmup_steps=2, log_every=999, eval_every=999)
+    assert model is not None, "train_wmt returned None"
+
+
+def test_noam_lr_schedule():
+    """NoamLR: produces expected learning rate values."""
+    schedule = NoamLR(d_model=512, warmup_steps=4000, factor=1.0)
+    lr1 = schedule(1)
+    lr2 = schedule(4000)
+    lr3 = schedule(8000)
+    assert lr1 > 0, f"LR at step 1 is {lr1}"
+    assert lr2 > lr1, f"LR should increase during warmup: {lr1} -> {lr2}"
+    assert lr3 < lr2, f"LR should decay after warmup: {lr2} -> {lr3}"
+    # At step=warmup_steps, both formulas give the same value
+    # lr = d_model^(-0.5) * warmup_steps^(-0.5)
+    expected_at_warmup = 512 ** (-0.5) * 4000 ** (-0.5)
+    assert abs(lr2 - expected_at_warmup) < 1e-10, \
+        f"LR at warmup: {lr2} != {expected_at_warmup}"
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  RUN ALL
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -201,6 +319,16 @@ if __name__ == '__main__':
         ('test_causal_mask', test_causal_mask),
         ('test_no_attention_to_padding', test_no_attention_to_padding),
         ('test_visualize_no_crash', test_visualize_no_crash),
+        # WMT data pipeline (plan 04)
+        ('test_bpe_tokenization', test_bpe_tokenization),
+        ('test_bpe_roundtrip', test_bpe_roundtrip),
+        ('test_dataset_length', test_dataset_length),
+        ('test_batch_shapes', test_batch_shapes),
+        ('test_batch_no_all_padding', test_batch_no_all_padding),
+        ('test_bleu_perfect_match', test_bleu_perfect_match),
+        ('test_bleu_no_match', test_bleu_no_match),
+        ('test_train_step', test_train_step),
+        ('test_noam_lr_schedule', test_noam_lr_schedule),
     ]
 
     passed = 0

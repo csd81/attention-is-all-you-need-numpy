@@ -30,5 +30,8 @@ Thumbs.db
 # Generated plots
 attn_demo_*.png
 
+# BPE model files (generated)
+test_data/bpe_test.*
+
 # Large binaries
 *.exe
