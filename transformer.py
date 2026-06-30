@@ -32,16 +32,25 @@ class Layer:
     """Base layer. Subclasses implement forward() and backward()."""
 
     def params(self):
-        """Yield all Param objects recursively."""
+        """Yield all Param objects recursively (no duplicates by id)."""
+        seen = set()
         for attr in self.__dict__.values():
             if isinstance(attr, Param):
-                yield attr
+                if id(attr) not in seen:
+                    seen.add(id(attr))
+                    yield attr
             elif isinstance(attr, Layer):
-                yield from attr.params()
+                for p in attr.params():
+                    if id(p) not in seen:
+                        seen.add(id(p))
+                        yield p
             elif isinstance(attr, list):
                 for item in attr:
                     if isinstance(item, Layer):
-                        yield from item.params()
+                        for p in item.params():
+                            if id(p) not in seen:
+                                seen.add(id(p))
+                                yield p
 
     def param_count(self):
         return sum(p.data.size for p in self.params())
@@ -56,23 +65,30 @@ class Layer:
 # ═══════════════════════════════════════════════════════════════════════
 
 class Linear(Layer):
-    """y = x @ W + b"""
-    def __init__(self, d_in, d_out):
-        limit = math.sqrt(6 / (d_in + d_out))
-        self.w = Param(d_in, d_out)
-        self.w.data = np.random.uniform(-limit, limit, (d_in, d_out)).astype(np.float64)
+    """y = x @ W + b. Supports external shared weight with transpose for proj."""
+    def __init__(self, d_in, d_out, weight=None, transpose_w=False):
+        self._transpose_w = transpose_w
+        if weight is not None:
+            self.w = weight  # external shared Param
+        else:
+            limit = math.sqrt(6 / (d_in + d_out))
+            self.w = Param(d_in, d_out)
+            self.w.data = np.random.uniform(-limit, limit, (d_in, d_out)).astype(np.float64)
         self.b = Param(d_out)
         self.b.data.fill(0.0)
         self._x = None  # cache for backward
 
+    def _get_w(self):
+        """Return the effective weight matrix for forward."""
+        return self.w.data.T if self._transpose_w else self.w.data
+
     def forward(self, x):
         self._x = x
-        return x @ self.w.data + self.b.data
+        return x @ self._get_w() + self.b.data
 
     def backward(self, dout):
         """dout: (..., d_out). Compute gradients for w, b, and dx."""
-        x = self._x  # (..., d_in)
-        # Reshape to (N, d_in) if needed
+        x = self._x
         orig_shape = x.shape
         if x.ndim > 2:
             x_2d = x.reshape(-1, x.shape[-1])
@@ -81,13 +97,18 @@ class Linear(Layer):
             x_2d = x
             dout_2d = dout
 
-        # dL/dW = x^T @ dout  (d_in, d_out)
-        self.w.grad += x_2d.T @ dout_2d
-        # dL/db = sum(dout, axis=0)
+        if self._transpose_w:
+            # y = x @ W^T + b   where W is (vocab, d_model)
+            # dL/dW[q,r] = sum_p dout[p,q] * x[p,r] = (dout^T @ x)[q,r]
+            self.w.grad += dout_2d.T @ x_2d   # (vocab, d_model)
+            dLdx = dout_2d @ self.w.data       # (N, d_model)
+        else:
+            # y = x @ W + b   where W is (d_in, d_out)
+            self.w.grad += x_2d.T @ dout_2d
+            dLdx = dout_2d @ self.w.data.T
+
         self.b.grad += dout_2d.sum(axis=0)
-        # dL/dx = dout @ W^T
-        dx = dout_2d @ self.w.data.T
-        return dx.reshape(orig_shape)
+        return dLdx.reshape(orig_shape)
 
 
 class LayerNorm(Layer):
@@ -129,8 +150,8 @@ class LayerNorm(Layer):
 
 class Embedding(Layer):
     """Lookup table. Forward: indices -> vectors. Backward: accumulate to correct rows."""
-    def __init__(self, vocab, dim):
-        self.w = Param(vocab, dim)
+    def __init__(self, vocab, dim, weight=None):
+        self.w = weight if weight is not None else Param(vocab, dim)
         self._indices = None
 
     def forward(self, indices):
@@ -325,8 +346,8 @@ class DecoderLayer(Layer):
 
 
 class Encoder(Layer):
-    def __init__(self, vocab_size, d_model=512, N=6, d_ff=2048, h=8):
-        self.embed = Embedding(vocab_size, d_model)
+    def __init__(self, vocab_size, d_model=512, N=6, d_ff=2048, h=8, shared_weight=None):
+        self.embed = Embedding(vocab_size, d_model, weight=shared_weight)
         self.layers = [EncoderLayer(d_model, d_ff, h) for _ in range(N)]
 
     def forward(self, x, mask=None):
@@ -356,8 +377,8 @@ class Encoder(Layer):
 
 
 class Decoder(Layer):
-    def __init__(self, vocab_size, d_model=512, N=6, d_ff=2048, h=8):
-        self.embed = Embedding(vocab_size, d_model)
+    def __init__(self, vocab_size, d_model=512, N=6, d_ff=2048, h=8, shared_weight=None):
+        self.embed = Embedding(vocab_size, d_model, weight=shared_weight)
         self.layers = [DecoderLayer(d_model, d_ff, h) for _ in range(N)]
 
     def forward(self, x, enc_out, src_mask=None, tgt_mask=None):
@@ -391,11 +412,14 @@ class Decoder(Layer):
 
 
 class Transformer(Layer):
-    """Section 3: Full encoder-decoder."""
+    """Section 3: Full encoder-decoder with weight tying (Section 3.4)."""
     def __init__(self, src_vocab, tgt_vocab, d_model=512, N=6, d_ff=2048, h=8):
-        self.encoder = Encoder(src_vocab, d_model, N, d_ff, h)
-        self.decoder = Decoder(tgt_vocab, d_model, N, d_ff, h)
-        self.proj = Linear(d_model, tgt_vocab)
+        # Shared weight: one Param for encoder embed, decoder embed, and proj
+        shared = Param(tgt_vocab, d_model)
+        self.encoder = Encoder(src_vocab, d_model, N, d_ff, h, shared_weight=shared)
+        self.decoder = Decoder(tgt_vocab, d_model, N, d_ff, h, shared_weight=shared)
+        # proj uses shared weight transposed: y = x @ W^T + b
+        self.proj = Linear(d_model, tgt_vocab, weight=shared, transpose_w=True)
         self._cache = None
 
     def forward(self, src, tgt, src_mask=None, tgt_mask=None):
