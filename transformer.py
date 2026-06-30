@@ -7,6 +7,7 @@ implements its own forward() and backward() methods.
 """
 import math
 import time
+import os
 import numpy as np
 
 
@@ -148,6 +149,24 @@ class LayerNorm(Layer):
         return dx
 
 
+class Dropout(Layer):
+    """Section 5.4: dropout applied during training, scaled by 1/(1-rate)."""
+    def __init__(self, rate=0.1):
+        self.rate = rate
+        self._mask = None
+
+    def forward(self, x, training=True):
+        if not training or self.rate == 0:
+            return x
+        self._mask = np.random.binomial(1, 1 - self.rate, x.shape).astype(np.float64)
+        return x * self._mask / (1 - self.rate)
+
+    def backward(self, dout):
+        if self._mask is None:
+            return dout
+        return dout * self._mask / (1 - self.rate)
+
+
 class Embedding(Layer):
     """Lookup table. Forward: indices -> vectors. Backward: accumulate to correct rows."""
     def __init__(self, vocab, dim, weight=None):
@@ -172,8 +191,8 @@ class Embedding(Layer):
 # ═══════════════════════════════════════════════════════════════════════
 
 class MultiHeadAttention(Layer):
-    """Section 3.2.2"""
-    def __init__(self, d_model=512, h=8):
+    """Section 3.2.2 with optional attention dropout (Section 5.4)."""
+    def __init__(self, d_model=512, h=8, dropout=0.1):
         assert d_model % h == 0
         self.d_model = d_model
         self.h = h
@@ -182,9 +201,10 @@ class MultiHeadAttention(Layer):
         self.wk = Linear(d_model, d_model)
         self.wv = Linear(d_model, d_model)
         self.wo = Linear(d_model, d_model)
+        self.attn_dropout = Dropout(dropout)
         self._cache = None
 
-    def forward(self, q_in, k_in, v_in, mask=None):
+    def forward(self, q_in, k_in, v_in, mask=None, training=True):
         B = q_in.shape[0]
         L, S = q_in.shape[1], k_in.shape[1]
 
@@ -197,19 +217,22 @@ class MultiHeadAttention(Layer):
         scores = Q @ K.transpose(0, 1, 3, 2) / math.sqrt(self.dk)
         if mask is not None:
             scores = np.where(mask, scores, -1e9)
-        attn = np.exp(scores - scores.max(axis=-1, keepdims=True))
-        attn = attn / attn.sum(axis=-1, keepdims=True)
+        attn_softmax = np.exp(scores - scores.max(axis=-1, keepdims=True))
+        attn_softmax = attn_softmax / attn_softmax.sum(axis=-1, keepdims=True)
+
+        # Attention dropout (Section 5.4)
+        attn = self.attn_dropout.forward(attn_softmax, training=training)
 
         out = attn @ V  # (B, h, L, dk)
         out = out.transpose(0, 2, 1, 3).reshape(B, L, self.d_model)
         out = self.wo.forward(out)
 
-        self._cache = (q_in, k_in, v_in, Q, K, V, attn, scores, mask, B, L, S)
+        self._cache = (q_in, k_in, v_in, Q, K, V, attn_softmax, attn, scores, mask, B, L, S)
         return out, attn
 
     def backward(self, dout):
         """dout: (B, L, d_model) - gradient from wo output."""
-        q_in, k_in, v_in, Q, K, V, attn, scores, mask, B, L, S = self._cache
+        q_in, k_in, v_in, Q, K, V, attn_softmax, attn, scores, mask, B, L, S = self._cache
 
         # Backward through wo
         dout_attn_out = self.wo.backward(dout)  # (B, L, d_model)
@@ -219,12 +242,14 @@ class MultiHeadAttention(Layer):
 
         # Backward through attention: out = attn @ V
         # d_attn = d_out @ V^T, d_V = attn^T @ d_out
-        d_attn = dout_attn @ V.transpose(0, 1, 3, 2)  # (B, h, L, L)
+        d_attn = dout_attn @ V.transpose(0, 1, 3, 2)  # (B, h, L, S) — grad w.r.t. post-dropout attn
         dV = attn.transpose(0, 1, 3, 2) @ dout_attn  # (B, h, S, dk)
 
-        # Backward through softmax
-        # d_scores = attn * (d_attn - sum(attn * d_attn, axis=-1, keepdims=True))
-        dscores = attn * (d_attn - (attn * d_attn).sum(axis=-1, keepdims=True))
+        # Backward through attention dropout → grad w.r.t. pre-dropout attn (same shape)
+        d_attn = self.attn_dropout.backward(d_attn)
+
+        # Backward through softmax using PRE-dropout attention weights
+        dscores = attn_softmax * (d_attn - (attn_softmax * d_attn).sum(axis=-1, keepdims=True))
 
         if mask is not None:
             dscores = np.where(mask, dscores, 0)
@@ -271,30 +296,32 @@ class PositionwiseFFN(Layer):
 # ═══════════════════════════════════════════════════════════════════════
 
 class EncoderLayer(Layer):
-    def __init__(self, d_model=512, d_ff=2048, h=8):
-        self.self_attn = MultiHeadAttention(d_model, h)
+    def __init__(self, d_model=512, d_ff=2048, h=8, dropout=0.1):
+        self.self_attn = MultiHeadAttention(d_model, h, dropout)
         self.ffn = PositionwiseFFN(d_model, d_ff)
         self.norm1 = LayerNorm(d_model)
         self.norm2 = LayerNorm(d_model)
+        self.dropout1 = Dropout(dropout)
+        self.dropout2 = Dropout(dropout)
         self._attn_store = None  # for capturing attention weights
 
-    def forward(self, x, mask=None):
-        attn_out, attn_w = self.self_attn.forward(x, x, x, mask)
+    def forward(self, x, mask=None, training=True):
+        attn_out, attn_w = self.self_attn.forward(x, x, x, mask, training=training)
         if self._attn_store is not None:
             self._attn_store.append(attn_w)  # (B, h, L, L)
-        x = self.norm1.forward(x + attn_out)
-        x = self.norm2.forward(x + self.ffn.forward(x))
+        x = self.norm1.forward(x + self.dropout1.forward(attn_out, training=training))
+        x = self.norm2.forward(x + self.dropout2.forward(self.ffn.forward(x), training=training))
         return x
 
     def backward(self, dout):
-        # Backward norm2 + residual (FFN)
+        # Backward norm2 + residual (FFN + dropout)
         dx2 = self.norm2.backward(dout)
-        dffn = self.ffn.backward(dx2)
+        dffn = self.ffn.backward(self.dropout2.backward(dx2))
         dx2 += dffn  # residual
 
-        # Backward norm1 + residual (attention)
+        # Backward norm1 + residual (attention + dropout)
         dx1 = self.norm1.backward(dx2)
-        dattn = self.self_attn.backward(dx1)
+        dattn = self.self_attn.backward(self.dropout1.backward(dx1))
         # residual: sum the three inputs to multi-head attention (q=k=v=x)
         dx = sum(dattn) if isinstance(dattn, tuple) else dattn
         dx1 += dx
@@ -302,50 +329,53 @@ class EncoderLayer(Layer):
 
 
 class DecoderLayer(Layer):
-    def __init__(self, d_model=512, d_ff=2048, h=8):
-        self.self_attn = MultiHeadAttention(d_model, h)
-        self.cross_attn = MultiHeadAttention(d_model, h)
+    def __init__(self, d_model=512, d_ff=2048, h=8, dropout=0.1):
+        self.self_attn = MultiHeadAttention(d_model, h, dropout)
+        self.cross_attn = MultiHeadAttention(d_model, h, dropout)
         self.ffn = PositionwiseFFN(d_model, d_ff)
         self.norm1 = LayerNorm(d_model)
         self.norm2 = LayerNorm(d_model)
         self.norm3 = LayerNorm(d_model)
+        self.dropout1 = Dropout(dropout)
+        self.dropout2 = Dropout(dropout)
+        self.dropout3 = Dropout(dropout)
         self._d_enc_out = None  # accumulated encoder gradient
         self._attn_store = None  # for capturing attention weights
 
-    def forward(self, x, enc_out, src_mask=None, tgt_mask=None):
+    def forward(self, x, enc_out, src_mask=None, tgt_mask=None, training=True):
         self._enc_out = enc_out
         self._src_mask = src_mask
         self._d_enc_out = None
 
-        attn_out, attn_w = self.self_attn.forward(x, x, x, tgt_mask)
+        attn_out, attn_w = self.self_attn.forward(x, x, x, tgt_mask, training=training)
         if self._attn_store is not None:
             self._attn_store.append(attn_w)  # decoder self-attention
-        x = self.norm1.forward(x + attn_out)
+        x = self.norm1.forward(x + self.dropout1.forward(attn_out, training=training))
 
-        attn_out, attn_w = self.cross_attn.forward(x, enc_out, enc_out, src_mask)
+        attn_out, attn_w = self.cross_attn.forward(x, enc_out, enc_out, src_mask, training=training)
         if self._attn_store is not None:
             self._attn_store.append(attn_w)  # decoder cross-attention
-        x = self.norm2.forward(x + attn_out)
+        x = self.norm2.forward(x + self.dropout2.forward(attn_out, training=training))
 
-        x = self.norm3.forward(x + self.ffn.forward(x))
+        x = self.norm3.forward(x + self.dropout3.forward(self.ffn.forward(x), training=training))
         return x
 
     def backward(self, dout):
-        # norm3 + residual (FFN)
+        # norm3 + residual (FFN + dropout)
         dx3 = self.norm3.backward(dout)
-        dffn = self.ffn.backward(dx3)
+        dffn = self.ffn.backward(self.dropout3.backward(dx3))
         dx3 += dffn
 
-        # norm2 + residual (cross-attn)
+        # norm2 + residual (cross-attn + dropout)
         dx2 = self.norm2.backward(dx3)
-        d_cross = self.cross_attn.backward(dx2)
+        d_cross = self.cross_attn.backward(self.dropout2.backward(dx2))
         # d_cross = (dq, dk, dv). q comes from decoder, k,v from encoder.
         dx2 += d_cross[0]  # gradient w.r.t. q (decoder side)
         self._d_enc_out = d_cross[1] + d_cross[2]  # accumulate encoder gradient
 
-        # norm1 + residual (self-attn)
+        # norm1 + residual (self-attn + dropout)
         dx1 = self.norm1.backward(dx2)
-        d_self = self.self_attn.backward(dx1)
+        d_self = self.self_attn.backward(self.dropout1.backward(dx1))
         if isinstance(d_self, tuple):
             dx1 += d_self[0] + d_self[1] + d_self[2]
         else:
@@ -354,28 +384,32 @@ class DecoderLayer(Layer):
 
 
 class Encoder(Layer):
-    def __init__(self, vocab_size, d_model=512, N=6, d_ff=2048, h=8, shared_weight=None):
+    def __init__(self, vocab_size, d_model=512, N=6, d_ff=2048, h=8,
+                 shared_weight=None, dropout=0.1):
         self.embed = Embedding(vocab_size, d_model, weight=shared_weight)
-        self.layers = [EncoderLayer(d_model, d_ff, h) for _ in range(N)]
+        self.embed_dropout = Dropout(dropout)
+        self.layers = [EncoderLayer(d_model, d_ff, h, dropout) for _ in range(N)]
 
-    def forward(self, x, mask=None, capture_attn=False):
+    def forward(self, x, mask=None, capture_attn=False, training=True):
         x = self.embed.forward(x) * math.sqrt(self.embed.w.shape[1])
         pe = self._make_pe(x.shape[1], x.shape[2])
-        x = x + pe
+        x = self.embed_dropout.forward(x + pe, training=training)
         if capture_attn:
             store = []
             for layer in self.layers:
                 layer._attn_store = store
-                x = layer.forward(x, mask)
+                x = layer.forward(x, mask, training=training)
                 layer._attn_store = None
             return x, {'self_attn': store}
         for layer in self.layers:
-            x = layer.forward(x, mask)
+            x = layer.forward(x, mask, training=training)
         return x
 
     def backward(self, dout):
         for layer in reversed(self.layers):
             dout = layer.backward(dout)
+        # Backward through embedding dropout
+        dout = self.embed_dropout.backward(dout)
         # Backward through embedding + PE (PE has no params)
         dx = self.embed.backward(dout)
         return dx
@@ -391,26 +425,29 @@ class Encoder(Layer):
 
 
 class Decoder(Layer):
-    def __init__(self, vocab_size, d_model=512, N=6, d_ff=2048, h=8, shared_weight=None):
+    def __init__(self, vocab_size, d_model=512, N=6, d_ff=2048, h=8,
+                 shared_weight=None, dropout=0.1):
         self.embed = Embedding(vocab_size, d_model, weight=shared_weight)
-        self.layers = [DecoderLayer(d_model, d_ff, h) for _ in range(N)]
+        self.embed_dropout = Dropout(dropout)
+        self.layers = [DecoderLayer(d_model, d_ff, h, dropout) for _ in range(N)]
 
-    def forward(self, x, enc_out, src_mask=None, tgt_mask=None, capture_attn=False):
+    def forward(self, x, enc_out, src_mask=None, tgt_mask=None,
+                capture_attn=False, training=True):
         x = self.embed.forward(x) * math.sqrt(self.embed.w.shape[1])
         pe = self._make_pe(x.shape[1], x.shape[2])
-        x = x + pe
+        x = self.embed_dropout.forward(x + pe, training=training)
         if capture_attn:
             store = []
             for layer in self.layers:
                 layer._attn_store = store
-                x = layer.forward(x, enc_out, src_mask, tgt_mask)
+                x = layer.forward(x, enc_out, src_mask, tgt_mask, training=training)
                 layer._attn_store = None
             # store: [self_attn_0, cross_attn_0, self_attn_1, cross_attn_1, ...]
             self_attn = store[0::2]   # even indices
             cross_attn = store[1::2]  # odd indices
             return x, {'self_attn': self_attn, 'cross_attn': cross_attn}
         for layer in self.layers:
-            x = layer.forward(x, enc_out, src_mask, tgt_mask)
+            x = layer.forward(x, enc_out, src_mask, tgt_mask, training=training)
         return x
 
     def backward(self, dout):
@@ -422,6 +459,8 @@ class Decoder(Layer):
                     enc_grad = layer._d_enc_out.copy()
                 else:
                     enc_grad += layer._d_enc_out
+        # Backward through embedding dropout
+        dout = self.embed_dropout.backward(dout)
         dx = self.embed.backward(dout)
         return enc_grad  # return accumulated encoder gradient
 
@@ -437,23 +476,27 @@ class Decoder(Layer):
 
 class Transformer(Layer):
     """Section 3: Full encoder-decoder with weight tying (Section 3.4)."""
-    def __init__(self, src_vocab, tgt_vocab, d_model=512, N=6, d_ff=2048, h=8):
+    def __init__(self, src_vocab, tgt_vocab, d_model=512, N=6, d_ff=2048, h=8,
+                 dropout=0.1):
         # Shared weight: one Param for encoder embed, decoder embed, and proj
         shared = Param(tgt_vocab, d_model)
-        self.encoder = Encoder(src_vocab, d_model, N, d_ff, h, shared_weight=shared)
-        self.decoder = Decoder(tgt_vocab, d_model, N, d_ff, h, shared_weight=shared)
+        self.encoder = Encoder(src_vocab, d_model, N, d_ff, h,
+                               shared_weight=shared, dropout=dropout)
+        self.decoder = Decoder(tgt_vocab, d_model, N, d_ff, h,
+                               shared_weight=shared, dropout=dropout)
         # proj uses shared weight transposed: y = x @ W^T + b
         self.proj = Linear(d_model, tgt_vocab, weight=shared, transpose_w=True)
         self._cache = None
 
-    def forward(self, src, tgt, src_mask=None, tgt_mask=None):
-        enc_out = self.encoder.forward(src, src_mask)
-        dec_out = self.decoder.forward(tgt, enc_out, src_mask, tgt_mask)
+    def forward(self, src, tgt, src_mask=None, tgt_mask=None, training=True):
+        enc_out = self.encoder.forward(src, src_mask, training=training)
+        dec_out = self.decoder.forward(tgt, enc_out, src_mask, tgt_mask, training=training)
         logits = self.proj.forward(dec_out)
         self._cache = (src, tgt, src_mask, tgt_mask)
         return logits
 
-    def forward_with_attention(self, src, tgt, src_mask=None, tgt_mask=None):
+    def forward_with_attention(self, src, tgt, src_mask=None, tgt_mask=None,
+                               training=False):
         """Forward pass that also returns all attention weights.
 
         Returns:
@@ -462,9 +505,9 @@ class Transformer(Layer):
                        lists of (B, h, seq, seq) attention weight arrays.
         """
         enc_out, enc_attn = self.encoder.forward(
-            src, src_mask, capture_attn=True)
+            src, src_mask, capture_attn=True, training=training)
         dec_out, dec_attn = self.decoder.forward(
-            tgt, enc_out, src_mask, tgt_mask, capture_attn=True)
+            tgt, enc_out, src_mask, tgt_mask, capture_attn=True, training=training)
         logits = self.proj.forward(dec_out)
         return logits, {'encoder': enc_attn, 'decoder': dec_attn}
 
@@ -527,6 +570,58 @@ class Adam:
             p.data -= self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
 
 
+def clip_gradients(model, max_norm=5.0):
+    """Clip global gradient norm to max_norm (Plan 05)."""
+    total_norm = 0.0
+    for p in model.params():
+        total_norm += (p.grad ** 2).sum()
+    total_norm = math.sqrt(total_norm)
+    if total_norm > max_norm and total_norm > 0:
+        scale = max_norm / total_norm
+        for p in model.params():
+            p.grad *= scale
+    return total_norm
+
+
+def save_checkpoint(model, optimizer, path, step=None, loss=None, extra=None):
+    """Save model weights, optimizer state, and metadata (Plan 06)."""
+    state = {'step': step, 'loss': loss}
+    for i, p in enumerate(model.params()):
+        state[f'param_{i}'] = p.data
+        state[f'grad_{i}'] = p.grad
+    if optimizer is not None:
+        for i, (m, v) in enumerate(zip(optimizer.m, optimizer.v)):
+            state[f'm_{i}'] = m
+            state[f'v_{i}'] = v
+        state['opt_t'] = optimizer.t
+    if extra:
+        state.update(extra)
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    np.savez_compressed(path, **state)
+
+
+def load_checkpoint(model, optimizer, path):
+    """Load model weights and optimizer state from a checkpoint."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Checkpoint not found: {path}")
+    state = np.load(path, allow_pickle=True)
+    for i, p in enumerate(model.params()):
+        key = f'param_{i}'
+        if key in state:
+            p.data[:] = state[key]
+            if f'grad_{i}' in state:
+                p.grad[:] = state[f'grad_{i}']
+    if optimizer is not None and 'opt_t' in state:
+        for i, (m, v) in enumerate(zip(optimizer.m, optimizer.v)):
+            key_m, key_v = f'm_{i}', f'v_{i}'
+            if key_m in state:
+                m[:] = state[key_m]
+            if key_v in state:
+                v[:] = state[key_v]
+        optimizer.t = int(state['opt_t'])
+    return state
+
+
 def softmax(x, axis=-1):
     x_max = x.max(axis=axis, keepdims=True)
     exp = np.exp(x - x_max)
@@ -567,16 +662,33 @@ def make_copy_batch(vocab_size, seq_len, batch_size, bos_idx=1, eos_idx=2):
 
 
 def train_copy(model, steps=500, batch_size=16, seq_len=5, vocab_size=20,
-               lr=1e-3, log_every=100):
-    opt = Adam(model.params(), lr=lr)
+               lr=1e-3, log_every=100, use_noam=False, clip_norm=0.0,
+               d_model=32, warmup_steps=100, checkpoint_dir=None,
+               save_every=9999):
+    """
+    Train on copy task with optional NoamLR, gradient clipping, checkpointing.
 
-    for step in range(1, steps + 1):
+    Args:
+        model: Transformer instance
+        use_noam: if True, use NoamLR schedule instead of fixed LR
+        clip_norm: max gradient norm (0 = no clipping)
+        checkpoint_dir: if set, save checkpoints here
+        save_every: save checkpoint every N steps
+    """
+    opt = Adam(model.params(), lr=lr)
+    lr_schedule = NoamLR(d_model=d_model, warmup_steps=warmup_steps) if use_noam else None
+    start_step = 0
+
+    for step in range(start_step + 1, steps + 1):
+        if use_noam:
+            opt.lr = lr_schedule(step)
+
         src_np, tgt_in_np, tgt_out_np = make_copy_batch(vocab_size, seq_len, batch_size)
 
         src_mask = model.make_src_mask(src_np)
         tgt_mask = model.make_tgt_mask(tgt_in_np)
 
-        logits = model.forward(src_np, tgt_in_np, src_mask, tgt_mask)
+        logits = model.forward(src_np, tgt_in_np, src_mask, tgt_mask, training=True)
         B, L, C = logits.shape
 
         loss, dlogits = cross_entropy_loss(
@@ -585,6 +697,8 @@ def train_copy(model, steps=500, batch_size=16, seq_len=5, vocab_size=20,
 
         model.zero_grad()
         model.backward(dlogits.reshape(B, L, C))
+
+        grad_norm = clip_gradients(model, max_norm=clip_norm) if clip_norm > 0 else 0.0
         opt.step()
 
         if step % log_every == 0 or step == 1:
@@ -592,37 +706,46 @@ def train_copy(model, steps=500, batch_size=16, seq_len=5, vocab_size=20,
             correct = (preds == tgt_out_np).sum()
             total = tgt_out_np.size
             acc = correct / total * 100
+            gn = f"  grad_norm {grad_norm:.2f}" if clip_norm > 0 else ""
             print(f"step {step:4d}  loss {loss:.4f}  acc {acc:.1f}%  "
-                  f"lr {opt.lr:.2e}")
+                  f"lr {opt.lr:.2e}{gn}")
+
+        if checkpoint_dir and step % save_every == 0:
+            ckpt_path = os.path.join(checkpoint_dir, f'checkpoint_step_{step:06d}.npz')
+            save_checkpoint(model, opt, ckpt_path, step=step, loss=loss)
+            # Also overwrite latest
+            latest_path = os.path.join(checkpoint_dir, 'checkpoint_latest.npz')
+            save_checkpoint(model, opt, latest_path, step=step, loss=loss)
 
     return model
 
 
 def train_wmt(model, dataset, steps=10000, batch_size=32, d_model=512,
                warmup_steps=4000, log_every=100, eval_every=500,
-               tokenizer=None, dev_dataset=None):
+               tokenizer=None, dev_dataset=None, clip_norm=0.0,
+               checkpoint_dir=None, save_every=1000):
     """
-    Training loop for parallel text with Noam learning rate schedule.
+    Training loop for parallel text with NoamLR, clipping, and checkpointing.
 
     Args:
-        model: Transformer instance
-        dataset: ParallelDataset (yields src, tgt_in, tgt_out batches)
-        steps: total training steps
-        batch_size: batch size for each step
-        d_model: model dimension used in NoamLR scaling
-        warmup_steps: NoamLR warmup steps
-        log_every: print progress every N steps
-        eval_every: run dev BLEU every N steps
-        tokenizer: BPETokenizer (needed for BLEU eval)
-        dev_dataset: ParallelDataset for evaluation
-
-    Returns:
-        trained model
+        clip_norm: max gradient norm (0 = no clipping)
+        checkpoint_dir: if set, save checkpoints here
+        save_every: save checkpoint every N steps
     """
     opt = Adam(model.params(), lr=1.0)  # lr overridden by NoamLR
     lr_schedule = NoamLR(d_model=d_model, warmup_steps=warmup_steps)
-    step = 0
 
+    # Resume from checkpoint if available
+    start_step = 0
+    if checkpoint_dir:
+        latest = os.path.join(checkpoint_dir, 'checkpoint_latest.npz')
+        if os.path.exists(latest):
+            print(f"  Resuming from checkpoint: {latest}")
+            state = load_checkpoint(model, opt, latest)
+            start_step = int(state.get('step', 0))
+            print(f"  Resumed at step {start_step}")
+
+    step = start_step
     while step < steps:
         for src, tgt_in, tgt_out in dataset.batches(batch_size=batch_size):
             step += 1
@@ -631,7 +754,7 @@ def train_wmt(model, dataset, steps=10000, batch_size=32, d_model=512,
             src_mask = model.make_src_mask(src)
             tgt_mask = model.make_tgt_mask(tgt_in)
 
-            logits = model.forward(src, tgt_in, src_mask, tgt_mask)
+            logits = model.forward(src, tgt_in, src_mask, tgt_mask, training=True)
             B, L, C = logits.shape
 
             loss, dlogits = cross_entropy_loss(
@@ -640,6 +763,8 @@ def train_wmt(model, dataset, steps=10000, batch_size=32, d_model=512,
 
             model.zero_grad()
             model.backward(dlogits.reshape(B, L, C))
+
+            grad_norm = clip_gradients(model, max_norm=clip_norm) if clip_norm > 0 else 0.0
             opt.step()
 
             if step % log_every == 0 or step == 1:
@@ -648,14 +773,27 @@ def train_wmt(model, dataset, steps=10000, batch_size=32, d_model=512,
                 correct = ((preds == tgt_out) & mask).sum()
                 total = mask.sum()
                 acc = correct / max(total, 1) * 100
+                gn = f"  grad_norm {grad_norm:.2f}" if clip_norm > 0 else ""
                 print(f"step {step:6d}  loss {loss:.4f}  acc {acc:.1f}%  "
-                      f"lr {opt.lr:.2e}")
+                      f"lr {opt.lr:.2e}{gn}")
 
             if step % eval_every == 0 and tokenizer is not None and dev_dataset is not None:
                 _eval_bleu(model, dev_dataset, tokenizer, step)
 
+            if checkpoint_dir and step % save_every == 0:
+                ckpt_path = os.path.join(checkpoint_dir, f'checkpoint_step_{step:06d}.npz')
+                save_checkpoint(model, opt, ckpt_path, step=step, loss=loss)
+                latest_path = os.path.join(checkpoint_dir, 'checkpoint_latest.npz')
+                save_checkpoint(model, opt, latest_path, step=step, loss=loss)
+
             if step >= steps:
                 break
+
+    # Save final checkpoint
+    if checkpoint_dir:
+        final_path = os.path.join(checkpoint_dir, 'checkpoint_final.npz')
+        save_checkpoint(model, opt, final_path, step=step, loss=loss)
+        print(f"  Saved final checkpoint: {final_path}")
 
     return model
 
@@ -675,7 +813,7 @@ def _eval_bleu(model, dataset, tokenizer, step, max_samples=50):
             src_tokens = src_batch[i]
             # Strip padding
             src_tokens = src_tokens[src_tokens != 0]
-            # Use greedy decoding
+            # Use greedy decoding (inference mode = no dropout)
             out_tokens = translate(model, src_tokens, bos_idx=2, eos_idx=3)
 
             hyp_text = tokenizer.decode(out_tokens)
@@ -696,14 +834,14 @@ def _eval_bleu(model, dataset, tokenizer, step, max_samples=50):
 
 
 def translate(model, src_np, max_len=30, bos_idx=1, eos_idx=2):
-    """Greedy autoregressive decoding."""
+    """Greedy autoregressive decoding (inference mode, no dropout)."""
     src_mask = model.make_src_mask(src_np[None, :])
-    enc_out = model.encoder.forward(src_np[None, :], src_mask)
+    enc_out = model.encoder.forward(src_np[None, :], src_mask, training=False)
 
     tgt = np.array([[bos_idx]], dtype=np.int64)
     for _ in range(max_len):
         tgt_mask = model.make_tgt_mask(tgt)
-        dec_out = model.decoder.forward(tgt, enc_out, src_mask, tgt_mask)
+        dec_out = model.decoder.forward(tgt, enc_out, src_mask, tgt_mask, training=False)
         logits = model.proj.forward(dec_out)
         next_token = logits[0, -1].argmax()
         tgt = np.concatenate([tgt, [[next_token]]], axis=1)
@@ -719,7 +857,7 @@ def translate(model, src_np, max_len=30, bos_idx=1, eos_idx=2):
 def translate_beam(model, src_np, beam_size=4, max_len=30, alpha=0.6,
                    bos_idx=1, eos_idx=2):
     """
-    Beam search decoding (Section 5.5).
+    Beam search decoding (Section 5.5). Inference mode = no dropout.
 
     Maintains `beam_size` candidate hypotheses. At each step, expands every
     hypothesis by the full vocabulary, then prunes to the top `beam_size`
@@ -728,7 +866,7 @@ def translate_beam(model, src_np, beam_size=4, max_len=30, alpha=0.6,
     Encoder runs once; decoder runs on the full beam in parallel.
     """
     src_mask = model.make_src_mask(src_np[None, :])
-    enc_out = model.encoder.forward(src_np[None, :], src_mask)
+    enc_out = model.encoder.forward(src_np[None, :], src_mask, training=False)
 
     # Each beam: (tokens list, score)
     beams = [([bos_idx], 0.0)]
@@ -748,11 +886,12 @@ def translate_beam(model, src_np, beam_size=4, max_len=30, alpha=0.6,
         for i, (toks, _) in enumerate(active):
             tgt_batch[i, :len(toks)] = toks
 
-        # Batched decoder forward
+        # Batched decoder forward (inference mode)
         tgt_mask = model.make_tgt_mask(tgt_batch)
         enc_batch = np.repeat(enc_out, B, axis=0)
         logits = model.proj.forward(
-            model.decoder.forward(tgt_batch, enc_batch, src_mask, tgt_mask))
+            model.decoder.forward(tgt_batch, enc_batch, src_mask, tgt_mask,
+                                  training=False))
         last_lp = np.log(softmax(logits[:, -1, :], axis=-1) + 1e-9)
 
         # Expand: each active beam -> vocab_size candidates, keep top beam_size
@@ -806,7 +945,7 @@ if __name__ == '__main__':
     VOCAB = 20
     SEQ_LEN = 4
 
-    model = Transformer(VOCAB, VOCAB, d_model=32, N=2, d_ff=64, h=4)
+    model = Transformer(VOCAB, VOCAB, d_model=32, N=2, d_ff=64, h=4, dropout=0)
     print(f"Train model:     {model.param_count():,} params\n")
 
     # Before training

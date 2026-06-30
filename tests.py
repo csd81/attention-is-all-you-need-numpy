@@ -9,6 +9,7 @@ sys.path.insert(0, '.')
 from transformer import (
     Transformer, translate, translate_beam, train_copy, train_wmt,
     make_copy_batch, Param, softmax, NoamLR, Adam,
+    Dropout, clip_gradients, save_checkpoint, load_checkpoint,
 )
 from data import BPETokenizer, ParallelDataset, corpus_bleu, sentence_bleu, BOS_ID, EOS_ID, PAD_ID, UNK_ID
 
@@ -32,7 +33,7 @@ def test_weight_identity():
 
 def test_gradient_accumulation():
     """Weight tying: gradients accumulate into the same array."""
-    m = Transformer(20, 20, d_model=32, N=2, d_ff=64, h=4)
+    m = Transformer(20, 20, d_model=32, N=2, d_ff=64, h=4, dropout=0)
     src = np.random.randint(3, 20, (2, 4)).astype(np.int64)
     tgt_in = np.concatenate([np.full((2, 1), 1), src], axis=1)
     tgt_out = np.concatenate([src, np.full((2, 1), 2)], axis=1)
@@ -54,7 +55,7 @@ def test_gradient_accumulation():
 
 def test_training_still_works():
     """Weight tying: copy task still reaches high accuracy."""
-    m = Transformer(20, 20, d_model=32, N=2, d_ff=64, h=4)
+    m = Transformer(20, 20, d_model=32, N=2, d_ff=64, h=4, dropout=0)
     np.random.seed(42)
     m = train_copy(m, steps=300, batch_size=16, seq_len=4, vocab_size=20, log_every=999)
     out = translate(m, np.array([5, 8, 3, 12]))
@@ -67,7 +68,7 @@ def test_training_still_works():
 
 def test_beam_size_1_equals_greedy():
     """Beam search: beam=1 produces same output as greedy."""
-    m = Transformer(20, 20, d_model=32, N=2, d_ff=64, h=4)
+    m = Transformer(20, 20, d_model=32, N=2, d_ff=64, h=4, dropout=0)
     np.random.seed(42)
     m = train_copy(m, steps=200, batch_size=16, seq_len=4, vocab_size=20, log_every=999)
     src = np.array([5, 8, 3, 12])
@@ -78,7 +79,7 @@ def test_beam_size_1_equals_greedy():
 
 def test_beam_terminates():
     """Beam search: always returns within max_len tokens."""
-    m = Transformer(20, 20, d_model=32, N=2, d_ff=64, h=4)
+    m = Transformer(20, 20, d_model=32, N=2, d_ff=64, h=4, dropout=0)
     for _ in range(5):
         src = np.random.randint(3, 20, (4,))
         out = translate_beam(m, src, max_len=30)
@@ -88,7 +89,7 @@ def test_beam_terminates():
 
 def test_beam_reproduces_input():
     """Beam search: trained copy model copies correctly."""
-    m = Transformer(20, 20, d_model=32, N=2, d_ff=64, h=4)
+    m = Transformer(20, 20, d_model=32, N=2, d_ff=64, h=4, dropout=0)
     np.random.seed(42)
     m = train_copy(m, steps=200, batch_size=16, seq_len=4, vocab_size=20, log_every=999)
     out = translate_beam(m, np.array([5, 8, 3, 12]), beam_size=4)
@@ -170,7 +171,7 @@ def test_no_attention_to_padding():
 def test_visualize_no_crash():
     """Visualization: runs without error on a small model."""
     from visualize import visualize_all, _tokens_to_str, plot_attention_grid
-    m = Transformer(20, 20, d_model=32, N=2, d_ff=64, h=4)
+    m = Transformer(20, 20, d_model=32, N=2, d_ff=64, h=4, dropout=0)
     np.random.seed(42)
     m = train_copy(m, steps=100, batch_size=8, seq_len=4, vocab_size=20, log_every=999)
     src = np.array([[5, 8, 3, 12]], dtype=np.int64)
@@ -301,6 +302,284 @@ def test_noam_lr_schedule():
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  DROPOUT (plan 07)
+# ═══════════════════════════════════════════════════════════════════════
+
+def test_dropout_training_vs_eval():
+    """Dropout: forward pass differs between train and eval modes."""
+    d = Dropout(rate=0.5)
+    x = np.ones((100, 100), dtype=np.float64)
+    out_train = d.forward(x, training=True)
+    out_eval = d.forward(x, training=False)
+    # Eval returns x unchanged
+    assert np.allclose(out_eval, x), "eval mode should not modify input"
+    # Training mode zeros out ~rate fraction
+    zero_frac = (out_train == 0).mean()
+    assert 0.3 < zero_frac < 0.7, f"zero fraction {zero_frac:.3f} not ~0.5"
+
+
+def test_dropout_eval_deterministic():
+    """Dropout: same input in eval mode always gives same output."""
+    d = Dropout(rate=0.5)
+    x = np.random.randn(10, 10)
+    out1 = d.forward(x, training=False)
+    out2 = d.forward(x, training=False)
+    assert np.allclose(out1, out2), "eval mode should be deterministic"
+
+
+def test_dropout_rate_zero():
+    """Dropout: rate=0 behaves identically to no dropout."""
+    d = Dropout(rate=0.0)
+    x = np.random.randn(10, 10)
+    out = d.forward(x, training=True)
+    assert np.allclose(out, x), "rate=0 should pass through unchanged"
+
+
+def test_dropout_backward():
+    """Dropout: backward pass completes without error in training mode."""
+    d = Dropout(rate=0.1)
+    x = np.ones((5, 10), dtype=np.float64)
+    out = d.forward(x, training=True)
+    dout = np.ones_like(out)
+    dx = d.backward(dout)
+    assert dx.shape == x.shape, f"backward shape {dx.shape} != {x.shape}"
+    # Non-masked positions should have gradient 1/(1-rate)
+    assert not np.all(dx == 0), "all gradients are zero"
+
+
+def test_dropout_attn_forward():
+    """Dropout: forward_with_attention works with dropout enabled."""
+    m = Transformer(20, 20, d_model=32, N=2, d_ff=64, h=4)
+    src = np.random.randint(3, 20, (1, 4)).astype(np.int64)
+    tgt_in = np.array([[1, 5, 8, 3, 12]], dtype=np.int64)
+    src_mask = m.make_src_mask(src)
+    tgt_mask = m.make_tgt_mask(tgt_in)
+    # Should not error regardless of training mode
+    logits1, attn1 = m.forward_with_attention(src, tgt_in, src_mask, tgt_mask, training=True)
+    logits2, attn2 = m.forward_with_attention(src, tgt_in, src_mask, tgt_mask, training=False)
+    assert logits1.shape == logits2.shape, "shape mismatch between train/eval"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  GRADIENT CLIPPING + NOAM LR (plan 05)
+# ═══════════════════════════════════════════════════════════════════════
+
+def test_gradient_clip_norm():
+    """Gradient clipping: after clipping, global norm <= max_norm."""
+    m = Transformer(20, 20, d_model=32, N=2, d_ff=64, h=4, dropout=0)
+    src = np.random.randint(3, 20, (2, 4)).astype(np.int64)
+    tgt_in = np.concatenate([np.full((2, 1), 1), src], axis=1)
+    tgt_out = np.concatenate([src, np.full((2, 1), 2)], axis=1)
+    src_mask = m.make_src_mask(src)
+    tgt_mask = m.make_tgt_mask(tgt_in)
+    logits = m.forward(src, tgt_in, src_mask, tgt_mask, training=True)
+    from transformer import cross_entropy_loss
+    loss, dlogits = cross_entropy_loss(logits.reshape(-1, 20), tgt_out.reshape(-1))
+    m.zero_grad()
+    m.backward(dlogits.reshape(2, 5, 20))
+
+    max_norm = 0.5
+    clip_gradients(m, max_norm=max_norm)
+    # Compute actual norm after clipping
+    total_norm = math.sqrt(sum((p.grad ** 2).sum() for p in m.params()))
+    assert total_norm <= max_norm + 1e-6, \
+        f"post-clip grad norm {total_norm:.4f} > max_norm {max_norm}"
+
+
+def test_gradient_clip_preserves_direction():
+    """Gradient clipping: direction is preserved (scaled, not rotated)."""
+    m = Transformer(20, 20, d_model=32, N=2, d_ff=64, h=4, dropout=0)
+    src = np.random.randint(3, 20, (2, 4)).astype(np.int64)
+    tgt_in = np.concatenate([np.full((2, 1), 1), src], axis=1)
+    tgt_out = np.concatenate([src, np.full((2, 1), 2)], axis=1)
+    src_mask = m.make_src_mask(src)
+    tgt_mask = m.make_tgt_mask(tgt_in)
+    logits = m.forward(src, tgt_in, src_mask, tgt_mask, training=True)
+    from transformer import cross_entropy_loss
+    loss, dlogits = cross_entropy_loss(logits.reshape(-1, 20), tgt_out.reshape(-1))
+    m.zero_grad()
+    m.backward(dlogits.reshape(2, 5, 20))
+
+    # Save pre-clip gradients (flattened)
+    grads_before = [p.grad.flatten().copy() for p in m.params()]
+    g_before_flat = np.concatenate(grads_before)
+    norm_before = np.linalg.norm(g_before_flat)
+
+    clip_gradients(m, max_norm=norm_before * 0.5)  # clip to 50% of original
+
+    grads_after = [p.grad.flatten().copy() for p in m.params()]
+    g_after_flat = np.concatenate(grads_after)
+
+    # Direction should be the same (cosine sim ~ 1)
+    dot = np.dot(g_before_flat, g_after_flat)
+    norm_product = np.linalg.norm(g_before_flat) * np.linalg.norm(g_after_flat)
+    cos_sim = dot / max(norm_product, 1e-12)
+    assert cos_sim > 0.999, f"cosine similarity {cos_sim:.6f} < 0.999"
+
+
+def test_noam_custom_scaling():
+    """NoamLR: larger d_model gives lower peak LR."""
+    small = NoamLR(d_model=128, warmup_steps=100)
+    large = NoamLR(d_model=512, warmup_steps=100)
+    assert small(100) > large(100), "smaller d_model should have higher peak LR"
+
+
+def test_training_with_clip():
+    """Training: copy task converges with gradient clipping."""
+    m = Transformer(20, 20, d_model=32, N=2, d_ff=64, h=4, dropout=0)
+    np.random.seed(42)
+    m = train_copy(m, steps=300, batch_size=16, seq_len=4, vocab_size=20,
+                   log_every=999, clip_norm=5.0)
+    out = translate(m, np.array([5, 8, 3, 12]))
+    assert out[1:5].tolist() == [5, 8, 3, 12], f"copy failed: {out.tolist()}"
+
+
+def test_training_with_noam():
+    """Training: NoamLR schedule runs without error on copy task."""
+    m = Transformer(20, 20, d_model=32, N=2, d_ff=64, h=4, dropout=0)
+    np.random.seed(42)
+    m = train_copy(m, steps=10, batch_size=16, seq_len=4, vocab_size=20,
+                   log_every=999, use_noam=True, d_model=32, warmup_steps=5)
+    out = translate(m, np.array([5, 8, 3, 12]))
+    assert len(out) > 0, "empty output after NoamLR training"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  CHECKPOINTING (plan 06)
+# ═══════════════════════════════════════════════════════════════════════
+
+def test_save_and_load_params():
+    """Checkpoint: loaded model produces identical forward pass."""
+    m1 = Transformer(20, 20, d_model=32, N=2, d_ff=64, h=4)
+    m2 = Transformer(20, 20, d_model=32, N=2, d_ff=64, h=4)
+    opt1 = Adam(m1.params(), lr=1e-3)
+
+    import tempfile, os
+    path = os.path.join(tempfile.gettempdir(), 'test_checkpoint.npz')
+    save_checkpoint(m1, opt1, path, step=10, loss=1.5)
+    load_checkpoint(m2, None, path)
+
+    # Both models should produce same output on same input
+    src = np.random.randint(3, 20, (1, 4)).astype(np.int64)
+    tgt_in = np.array([[1, 5, 8, 3, 12]], dtype=np.int64)
+    src_mask = m1.make_src_mask(src)
+    tgt_mask = m1.make_tgt_mask(tgt_in)
+    out1 = m1.forward(src, tgt_in, src_mask, tgt_mask, training=False)
+    out2 = m2.forward(src, tgt_in, src_mask, tgt_mask, training=False)
+    assert np.allclose(out1, out2), "outputs differ after save/load"
+
+    # Clean up
+    os.remove(path)
+
+
+def test_save_and_load_optimizer():
+    """Checkpoint: optimizer state is identical after save/load cycle."""
+    m = Transformer(20, 20, d_model=32, N=2, d_ff=64, h=4, dropout=0)
+    opt1 = Adam(m.params(), lr=1e-3)
+
+    # Take one step to prime optimizer state
+    src = np.random.randint(3, 20, (2, 4)).astype(np.int64)
+    tgt_in = np.concatenate([np.full((2, 1), 1), src], axis=1)
+    tgt_out = np.concatenate([src, np.full((2, 1), 2)], axis=1)
+    src_mask = m.make_src_mask(src)
+    tgt_mask = m.make_tgt_mask(tgt_in)
+    logits = m.forward(src, tgt_in, src_mask, tgt_mask, training=True)
+    from transformer import cross_entropy_loss
+    loss, dlogits = cross_entropy_loss(logits.reshape(-1, 20), tgt_out.reshape(-1))
+    m.zero_grad()
+    m.backward(dlogits.reshape(2, 5, 20))
+    opt1.step()
+
+    m_before = opt1.m[0].copy()
+    v_before = opt1.v[0].copy()
+    t_before = opt1.t
+
+    import tempfile, os
+    path = os.path.join(tempfile.gettempdir(), 'test_opt_checkpoint.npz')
+    save_checkpoint(m, opt1, path, step=5, loss=2.0)
+
+    # New model + optimizer
+    m2 = Transformer(20, 20, d_model=32, N=2, d_ff=64, h=4)
+    opt2 = Adam(m2.params(), lr=1e-3)
+    load_checkpoint(m2, opt2, path)
+
+    assert np.allclose(opt2.m[0], m_before), "m state mismatch"
+    assert np.allclose(opt2.v[0], v_before), "v state mismatch"
+    assert opt2.t == t_before, f"t mismatch: {opt2.t} vs {t_before}"
+
+    os.remove(path)
+
+
+def test_checkpoint_file_exists():
+    """Checkpoint: file is created on disk after save."""
+    import tempfile, os
+    m = Transformer(20, 20, d_model=32, N=2, d_ff=64, h=4)
+    opt = Adam(m.params())
+    path = os.path.join(tempfile.gettempdir(), 'test_exists.npz')
+    save_checkpoint(m, opt, path, step=1)
+    assert os.path.exists(path), "checkpoint file not found"
+    os.remove(path)
+
+
+def test_load_nonexistent_raises():
+    """Checkpoint: loading missing file raises FileNotFoundError."""
+    import tempfile, os
+    m = Transformer(20, 20, d_model=32, N=2, d_ff=64, h=4)
+    path = os.path.join(tempfile.gettempdir(), 'nonexistent.npz')
+    try:
+        load_checkpoint(m, None, path)
+        assert False, "should have raised FileNotFoundError"
+    except FileNotFoundError:
+        pass
+
+
+def test_checkpoint_training_resume():
+    """Checkpoint: resumed training continues to reduce loss."""
+    import tempfile, os, shutil
+    ckpt_dir = os.path.join(tempfile.gettempdir(), 'test_resume_ckpt')
+    if os.path.exists(ckpt_dir):
+        shutil.rmtree(ckpt_dir)
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    np.random.seed(42)
+    m = Transformer(20, 20, d_model=32, N=2, d_ff=64, h=4, dropout=0)
+    opt = Adam(m.params(), lr=1e-3)
+
+    from transformer import cross_entropy_loss as cel
+    for step in range(1, 51):
+        src_np, tgt_in_np, tgt_out_np = make_copy_batch(20, 4, 16)
+        src_mask = m.make_src_mask(src_np)
+        tgt_mask = m.make_tgt_mask(tgt_in_np)
+        logits = m.forward(src_np, tgt_in_np, src_mask, tgt_mask, training=True)
+        B, L, C = logits.shape
+        loss, dlogits = cel(logits.reshape(-1, C), tgt_out_np.reshape(-1))
+        m.zero_grad()
+        m.backward(dlogits.reshape(B, L, C))
+        opt.step()
+
+    ckpt_path = os.path.join(ckpt_dir, 'checkpoint_step_000050.npz')
+    save_checkpoint(m, opt, ckpt_path, step=50, loss=loss)
+    loss_after_50 = loss
+
+    # Resume and train 50 more — loss should decrease
+    load_checkpoint(m, opt, ckpt_path)
+    for step in range(51, 101):
+        src_np, tgt_in_np, tgt_out_np = make_copy_batch(20, 4, 16)
+        src_mask = m.make_src_mask(src_np)
+        tgt_mask = m.make_tgt_mask(tgt_in_np)
+        logits = m.forward(src_np, tgt_in_np, src_mask, tgt_mask, training=True)
+        B, L, C = logits.shape
+        loss, dlogits = cel(logits.reshape(-1, C), tgt_out_np.reshape(-1))
+        m.zero_grad()
+        m.backward(dlogits.reshape(B, L, C))
+        opt.step()
+
+    assert loss < loss_after_50, \
+        f"loss increased after resume: {loss_after_50:.4f} -> {loss:.4f}"
+    shutil.rmtree(ckpt_dir)
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  RUN ALL
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -329,6 +608,24 @@ if __name__ == '__main__':
         ('test_bleu_no_match', test_bleu_no_match),
         ('test_train_step', test_train_step),
         ('test_noam_lr_schedule', test_noam_lr_schedule),
+        # Dropout (plan 07)
+        ('test_dropout_training_vs_eval', test_dropout_training_vs_eval),
+        ('test_dropout_eval_deterministic', test_dropout_eval_deterministic),
+        ('test_dropout_rate_zero', test_dropout_rate_zero),
+        ('test_dropout_backward', test_dropout_backward),
+        ('test_dropout_attn_forward', test_dropout_attn_forward),
+        # Gradient clipping + Noam (plan 05)
+        ('test_gradient_clip_norm', test_gradient_clip_norm),
+        ('test_gradient_clip_preserves_direction', test_gradient_clip_preserves_direction),
+        ('test_noam_custom_scaling', test_noam_custom_scaling),
+        ('test_training_with_clip', test_training_with_clip),
+        ('test_training_with_noam', test_training_with_noam),
+        # Checkpointing (plan 06)
+        ('test_save_and_load_params', test_save_and_load_params),
+        ('test_save_and_load_optimizer', test_save_and_load_optimizer),
+        ('test_checkpoint_file_exists', test_checkpoint_file_exists),
+        ('test_load_nonexistent_raises', test_load_nonexistent_raises),
+        ('test_checkpoint_training_resume', test_checkpoint_training_resume),
     ]
 
     passed = 0

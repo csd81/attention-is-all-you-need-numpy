@@ -33,5 +33,9 @@ attn_demo_*.png
 # BPE model files (generated)
 test_data/bpe_test.*
 
+# Checkpoints
+checkpoint_*.npz
+_test_ckpt/
+
 # Large binaries
 *.exe
